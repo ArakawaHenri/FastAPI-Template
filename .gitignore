@@ -1,0 +1,15 @@
+# System and IDE files
+.DS_Store
+desktop.ini
+Thumbs.db
+.vscode
+.idea
+
+# Local environment files
+.venv
+venv
+
+# Logs and temp files
+__pycache__
+*.log
+*.tmp
