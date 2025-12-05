@@ -9,7 +9,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Transaction Classifier: Initializer")
+        description="FastAPI Template: Initializer")
     parser.add_argument("--host", "-H", type=str,
                         default="0.0.0.0", help="Host to run the server on")
     parser.add_argument("--port", "-p", type=int,
