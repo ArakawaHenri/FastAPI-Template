@@ -16,9 +16,9 @@ class BaseService(ABC):
             raise NotImplementedError
 
         @staticmethod
-        @abstractmethod
-        async def dtor(instance: BaseService):
-            raise NotImplementedError
+        async def dtor(instance: BaseService) -> None:
+            """Override for cleanup. Default is no-op."""
+            pass
 
 
 type LifespanTasks = BaseService.LifespanTasks

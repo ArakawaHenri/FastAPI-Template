@@ -9,6 +9,7 @@ from app.core.dependencies import ServiceContainer, ServiceLifetime
 from app.core.logger import setup_logging, shutdown_logging
 from app.core.settings import settings
 from app.services.async_generator_example import ExampleGeneratorServiceT
+from app.services.database import DatabaseEngineService, DatabaseSessionServiceT
 from app.services.semaphore import SemaphoreService
 from app.services.transient_example import ExampleServiceT
 
@@ -18,6 +19,18 @@ async def lifespan(app: FastAPI):
     try:
         setup_logging(settings.LOG_DIR, settings.DEBUG_MODE)
 
+        # Production configuration validation
+        if not settings.DEBUG_MODE:
+            if not settings.CORS_ORIGINS:
+                logger.warning(
+                    "[LIFESPAN] CORS_ORIGINS is empty in production mode. "
+                    "Browsers will be blocked from accessing the API."
+                )
+            if settings.RELOAD:
+                logger.warning(
+                    "[LIFESPAN] RELOAD=true in production mode is not recommended."
+                )
+
         logger.debug("[LIFESPAN] Initialising service container...")
 
         app.state.services = ServiceContainer()
@@ -26,6 +39,25 @@ async def lifespan(app: FastAPI):
 
         # Keys for singleton services should be named with suffix `_service`
         # Keys for transient services should be named with suffix `_transient`
+
+        # Register database engines for each configured database
+        for key, db_config in settings.database.items():
+            await app.state.services.register(
+                f"{key}_database_service",
+                ServiceLifetime.SINGLETON,
+                DatabaseEngineService.LifespanTasks.ctor,
+                DatabaseEngineService.LifespanTasks.dtor,
+                **db_config.model_dump()
+            )
+
+        # Register generic session transient (use nested inject to specify engine)
+        # Usage: inject(DatabaseSessionServiceT, inject("main_database_service"))
+        await app.state.services.register(
+            None,  # Anonymous, resolve by type
+            ServiceLifetime.TRANSIENT,
+            DatabaseSessionServiceT.LifespanTasks.ctor,
+            None  # Cleanup handled by async generator
+        )
 
         # Create semaphore services as example singletons
         for key, value in settings.semaphores.items():

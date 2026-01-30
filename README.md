@@ -1,120 +1,230 @@
 # FastAPI Template
 
-A robust, modular, and opinionated FastAPI project template designed for building scalable business applications.
+Internal production template for FastAPI services. This README focuses on structure, conventions, and operational notes.
 
-## 🌟 Features
+## Requirements
 
-- **Modular Architecture**: DDD-inspired structure with clear separation of concerns (`api`, `core`, `services`,
-  `lifespan`).
-- **Custom Dependency Injection**: A powerful `ServiceContainer` supporting:
-    - **Singleton & Transient Lifetimes**: Manage resource-heavy objects (DB pools) vs per-request objects.
-    - **Async Generators**: Perfect for resources requiring setup/teardown context (like sessions).
-    - **Lazy Loading**: Services are initialized only when requested (or explicitly in lifespan).
-- **Advanced Logging**: Pre-configured `loguru` integration with rotation, retention, and standard library interception.
-- **Configuration Management**: Type-safe settings using `pydantic-settings` with `.env` support.
-- **API Versioning**: Built-in support for versioned APIs (`/api/v1/...`).
+- Python >= 3.12
+- Package manager: uv
 
-## 📋 Prerequisites
+## Quick start
 
-- **Python**: >= 3.12
-- **Package Manager**: [uv](https://github.com/astral-sh/uv)
-
-## 🚀 Getting Started
-
-### 1. Installation
-
-Clone the repository and install dependencies:
+1. Install dependencies:
 
 ```bash
 uv sync
 ```
 
-### 2. Configuration
-
-The application uses `pydantic-settings`. You can configure it via environment variables or a `.env` file.
-
-Create a `.env` file in the root directory:
-
-```ini
-DEBUG_MODE = true
-LOG_DIR = ./log
-APP_NAME = "FastAPI Template"
-APP_VERSION = "0.1.0"
-```
-
-### 3. Running the Application
-
-Use `uvicorn` or `fastapi` CLI to run the app:
+1. Pick a config example and copy it to `.env`:
 
 ```bash
-# Development mode
+cp .env.debug_example .env
+# or
+cp .env.production_example .env
+```
+
+1. Run the service:
+
+```bash
+# Development
 uv run fastapi dev app/main.py
 
-# Production mode
+# Production
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-The API will be available at `http://localhost:8000`.
-API Documentation (Swagger UI) is at `http://localhost:8000/docs`.
+## Configuration
 
-## 🧪 Testing
+Settings are loaded via `pydantic-settings` from environment variables and `.env` in the project root.
 
-This template includes a testing setup using `pytest` and `TestClient`.
+- `APP_NAME`, `APP_VERSION`: basic service metadata.
+- `DEBUG_MODE`: when true, validation errors include request body and unhandled exceptions are re-raised.
+- `RELOAD`: development-only hot reload flag for local runs.
+- `CORS_ORIGINS`: JSON list of allowed origins (example: `["https://example.com"]`).
+- `USE_PROXY_HEADERS`: enable `X-Forwarded-*` handling in uvicorn.
+- `FORWARDED_ALLOW_IPS`: comma-separated list of trusted proxy IPs/hosts.
+- `LOG_DIR`: log output directory (created automatically if missing).
+- `TMP_DIR`, `TMP_RETENTION_DAYS`: reserved for temporary files/cleanup workflows.
+- `SEMAPHORES__<name>`: nested config for semaphore services (uses `env_nested_delimiter="__"`).
 
-1. **Install Test Dependencies**:
-   *(Ensure `pytest` and `httpx` are installed in your environment)*
-   ```bash
-   uv add --dev pytest httpx
-   ```
+Use `.env.production_example` and `.env.debug_example` as starting points.
 
-2. **Run Tests**:
-   ```bash
-   uv run pytest
-   ```
+## Configuration reference
 
-## 🏗 Architecture Overview
+| Key | Type | Example | Notes |
+| --- | --- | --- | --- |
+| `APP_NAME` | string | `fastapi_app` | Service name |
+| `APP_VERSION` | string | `1.0.0` | Service version |
+| `DEBUG_MODE` | bool | `false` | Production should be `false` |
+| `RELOAD` | bool | `false` | Development only |
+| `CORS_ORIGINS` | JSON list | `["https://example.com"]` | Empty list disables CORS |
+| `USE_PROXY_HEADERS` | bool | `true` | Set when behind a reverse proxy |
+| `FORWARDED_ALLOW_IPS` | string | `10.0.0.0/8,127.0.0.1` | Trusted proxy IPs/hosts |
+| `LOG_DIR` | string | `./log` | Created automatically |
+| `TMP_DIR` | string | `./tmp` | Reserved |
+| `TMP_RETENTION_DAYS` | int | `3` | Reserved |
+| `SEMAPHORES__db` | int | `5` | Example nested config |
 
-### The Service Container (`app/core/dependencies.py`)
-
-The heart of this template is the custom `ServiceContainer`. Unlike standard FastAPI `Depends`, this container allows
-for:
-
-- **Decoupled Logic**: Services don't need to know about FastAPI `Request` objects.
-- **Complex Lifecycles**: Automatically handles cleanup (dtor) for transient services at the end of a request.
-
-**How to use:**
-
-1. **Define a Service**: Inherit from `BaseService`.
-2. **Register in Lifespan** (`app/lifespan/main.py`):
-   ```python
-   await app.state.services.register(
-       "my_service",
-       ServiceLifetime.TRANSIENT,
-       MyService.LifespanTasks.ctor,
-       MyService.LifespanTasks.dtor
-   )
-   ```
-3. **Inject in API**:
-   ```python
-   @router.get("/")
-   async def endpoint(svc: MyService = inject("my_service")):
-       ...
-   ```
-
-### Folder Structure
+## Project structure
 
 ```
 app/
-├── api/            # Route handlers (Controllers)
-│   └── v1/         # API Version 1
-├── core/           # Core infrastructure (DI, Logging, Settings)
-├── lifespan/       # App startup/shutdown logic
-├── middleware/     # Custom middlewares
-├── services/       # Business logic (Domain layer)
-└── main.py         # App entrypoint
+├── api/                      # Routing entrypoints
+│   ├── main.py               # /api router aggregation
+│   └── v1/                   # Versioned APIs
+│       ├── main.py           # /api/v1 router aggregation
+│       └── example/          # Exception examples (remove in production)
+├── core/                     # Infrastructure
+│   ├── dependencies.py       # ServiceContainer (DI) and inject helper
+│   ├── logger.py             # Loguru setup and stdlib interception
+│   └── settings.py           # Pydantic settings
+├── lifespan/                 # Startup/shutdown wiring
+│   └── main.py               # Service registration and teardown
+├── middleware/               # Request/response middleware
+│   ├── exception.py          # Error types and handlers
+│   └── logging.py            # Request logging
+├── services/                 # Business services and examples
+│   └── base.py               # BaseService and lifecycle contract
+└── main.py                   # FastAPI app factory
+main.py                       # CLI runner for uvicorn
 ```
 
-## 🛠 Development
+## Programming guide and conventions
 
-- **Linting**: Recommended to configure `ruff`.
-- **Formatting**: Recommended to configure `ruff` or `black`.
+### API layer
+
+- Keep handlers thin; delegate business logic to services.
+- Use `inject(...)` to obtain services; avoid manually constructing dependencies in handlers.
+- Return structured errors via exceptions from `app/middleware/exception.py`.
+
+### Services and DI
+
+- Naming: singletons end with `Service`, transients end with `ServiceT`.
+- Register services in `app/lifespan/main.py` with a clear key name; prefer explicit keys.
+- Use `inject("key")` for key-based resolution; use type-based injection only when a single service of that type exists.
+- Do not resolve services outside an event loop or across multiple loops.
+- Singletons should not depend on transients unless explicitly allowed.
+
+### Lifespan
+
+- Register all services in lifespan to control creation order and teardown.
+- For generator-based services, yield the instance and ensure cleanup in `finally`.
+- Avoid heavy work at import time; defer to lifespan registration.
+
+### Error handling
+
+- Use the custom exceptions for consistent error shapes and status codes.
+- `DEBUG_MODE=true` re-raises uncaught errors; production should keep it `false`.
+
+### Logging
+
+- Log files are rotated daily and retained for 7 days.
+- Avoid logging sensitive request bodies or tokens.
+- In debug mode, loguru `backtrace` and `diagnose` are enabled; disable in production.
+
+### Middleware order
+
+- Order matters: request logging should run before the transient finalizer.
+- `TransientServiceFinalizerMiddleware` must run after any middleware that creates transients.
+
+### Concurrency model
+
+> [!CAUTION]
+> **Do NOT use multiple workers (e.g., `--workers` flag or Gunicorn with multiple workers).**
+> The `ServiceContainer` is not thread-safe and assumes a single asyncio event loop.
+
+- Run a single uvicorn process per container/instance.
+- Scale horizontally by deploying multiple independent instances (Docker/K8s replicas).
+- If you need multiple workers, ensure each worker creates its own `ServiceContainer` instance (untested).
+
+### Tests
+
+- Tests rely on `TestClient` to trigger lifespan startup/shutdown.
+
+## Error handling
+
+This project uses a unified exception system in `app/middleware/exception.py`.
+
+### Custom exceptions
+
+- `NotFoundException` (404)
+- `UnauthorizedException` (401)
+- `ForbiddenException` (403)
+- `BadRequestException` (400)
+- `ConflictException` (409)
+- `RateLimitException` (429)
+
+Example:
+
+```python
+from app.middleware.exception import NotFoundException, BadRequestException
+
+if user is None:
+    raise NotFoundException("User", user_id)
+
+if "@" not in email:
+    raise BadRequestException(
+        "Invalid email format",
+        details={"field": "email", "value": email}
+    )
+```
+
+### Error response format
+
+```json
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable error message",
+    "details": {
+      "additional": "context"
+    },
+    "path": "/api/v1/users/123"
+  }
+}
+```
+
+`path` is only included when `DEBUG_MODE=true`.
+
+### Automatically handled exceptions
+
+| HTTP error | Status | Code |
+| --- | --- | --- |
+| 400 Bad Request | 400 | BAD_REQUEST |
+| 401 Unauthorized | 401 | UNAUTHORIZED |
+| 403 Forbidden | 403 | FORBIDDEN |
+| 404 Not Found | 404 | NOT_FOUND |
+| 405 Method Not Allowed | 405 | METHOD_NOT_ALLOWED |
+| 409 Conflict | 409 | CONFLICT |
+| 422 Unprocessable Entity | 422 | VALIDATION_ERROR |
+| 429 Too Many Requests | 429 | RATE_LIMIT_EXCEEDED |
+| 500 Internal Server Error | 500 | INTERNAL_ERROR |
+
+### Debug vs production
+
+- `DEBUG_MODE=false`: hide sensitive details; return generic 500 error for uncaught exceptions.
+- `DEBUG_MODE=true`: include request body in validation errors and re-raise uncaught exceptions.
+
+### Best practices
+
+- Raise typed exceptions in services; keep handlers thin.
+- Provide `details` for client actionability.
+- Use appropriate log level (`warning` for expected errors, `exception` for unexpected).
+
+## Deployment checklist
+
+- Confirm `DEBUG_MODE=false` and `RELOAD=false`.
+- Configure `CORS_ORIGINS` explicitly or keep it empty.
+- If behind a proxy, set `USE_PROXY_HEADERS=true` and configure `FORWARDED_ALLOW_IPS`.
+- Remove example routes under `/api/v1/example`.
+- Ensure log directory permissions for `LOG_DIR`.
+- Verify tmp directory policy if using `TMP_DIR`.
+- Run `PYTHONPATH=. uv run pytest` before deployment.
+
+## Notes and pitfalls
+
+- Example routes under `/api/v1/example` are for reference only; remove them for production services.
+- `CORS_ORIGINS` defaults to empty; configure explicitly for browsers.
+- Enable `USE_PROXY_HEADERS` only when behind trusted reverse proxies and set `FORWARDED_ALLOW_IPS` accordingly.
+- `DEBUG_MODE=true` exposes request body in validation errors; do not enable in production.
+- If transient services are resolved outside of a request context, their destructors will not run automatically.

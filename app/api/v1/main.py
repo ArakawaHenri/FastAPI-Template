@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
+from .example import router as example
+
 router = APIRouter(prefix="/v1")
 
-from .demo import router as demo
-
-router.include_router(demo, tags=["demo"])
+router.include_router(example)

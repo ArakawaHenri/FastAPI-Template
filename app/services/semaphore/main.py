@@ -9,5 +9,3 @@ class SemaphoreService(BaseService, Semaphore):
         @staticmethod
         async def ctor(*args, **kwargs) -> SemaphoreService:
             return SemaphoreService(*args, **kwargs)
-
-        dtor = None

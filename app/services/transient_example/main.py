@@ -10,8 +10,6 @@ class ExampleServiceT(BaseService):
         async def ctor() -> ExampleServiceT:
             return ExampleServiceT()
 
-        dtor = None
-
     hello_msg = "Hello!"
 
     async def hello(self):

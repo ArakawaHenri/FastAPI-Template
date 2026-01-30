@@ -1,8 +1,12 @@
+import contextvars
 import logging
 import sys
 from pathlib import Path
 
 from loguru import logger
+
+# Context variable for request tracing across async calls
+request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
 
 class InterceptHandler(logging.Handler):
@@ -27,6 +31,8 @@ def setup_logging(log_dir: str, debug: bool):
 
     console_level = "DEBUG" if debug else "INFO"
 
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+
     logger.add(
         sys.stderr,
         level=console_level,
@@ -36,16 +42,21 @@ def setup_logging(log_dir: str, debug: bool):
 
     log_file_path = Path(log_dir) / "app_{time}.log"
 
+    def request_id_patcher(record):
+        record["extra"]["request_id"] = request_id_ctx.get()
+
+    logger.configure(patcher=request_id_patcher)
+
     logger.add(
         log_file_path,
         level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {extra[request_id]} | {name}:{function}:{line} | {message}",
         rotation="00:00",
         retention="7 days",
         compression="zip",
         enqueue=True,
-        backtrace=True,
-        diagnose=True,
+        backtrace=debug,
+        diagnose=debug,
     )
 
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)

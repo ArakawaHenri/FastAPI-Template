@@ -5,8 +5,10 @@ import inspect
 import types
 import uuid
 import weakref
-from collections.abc import (AsyncGenerator as AsyncGeneratorABC, Awaitable as AwaitableABC, Coroutine as CoroutineABC,
-                             Generator as GeneratorABC)
+from collections.abc import AsyncGenerator as AsyncGeneratorABC
+from collections.abc import Awaitable as AwaitableABC
+from collections.abc import Coroutine as CoroutineABC
+from collections.abc import Generator as GeneratorABC
 from enum import IntEnum
 from typing import (
     Annotated,
@@ -220,6 +222,8 @@ class ServiceContainer:
     Service = Union[SingletonService, TransientService]
 
     def __init__(self) -> None:
+        import os
+
         # internal_id -> service
         self._services: dict[str, ServiceContainer.Service] = {}
         # public key -> internal_id
@@ -227,8 +231,11 @@ class ServiceContainer:
         # service_type -> set[internal_id]
         self._type_index: dict[Any, set[str]] = {}
 
-        # Guard against cross-loop / cross-thread access.
+        # Guard against cross-loop / cross-thread access
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Guard against cross-process access
+        self._pid: int = os.getpid()
 
         self.destructing: bool = False
         self._lock = asyncio.Lock()
@@ -237,6 +244,24 @@ class ServiceContainer:
     # Internal helpers                                                      #
     # --------------------------------------------------------------------- #
 
+    def _ensure_same_process(self) -> None:
+        """
+        Ensure the container is used from the same process it was created in.
+
+        This prevents issues in multi-process deployments (e.g., Gunicorn workers)
+        where each worker should have its own container instance.
+        """
+        import os
+        current_pid = os.getpid()
+        if self._pid != current_pid:
+            msg = (
+                f"ServiceContainer accessed from different process "
+                f"(created in PID {self._pid}, accessed from PID {current_pid}). "
+                f"Each process must have its own ServiceContainer instance."
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+
     def _ensure_event_loop(self) -> asyncio.AbstractEventLoop:
         """
         Ensure the container is always used from the same event loop.
@@ -244,6 +269,9 @@ class ServiceContainer:
         This is a best-effort runtime check to catch accidental cross-loop
         access early rather than failing in subtle ways later.
         """
+        # Check process isolation first
+        self._ensure_same_process()
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as exc:  # pragma: no cover - defensive
@@ -308,6 +336,13 @@ class ServiceContainer:
             ann = args[0] if args else None
             if ann is None:
                 return None
+            # Check if unwrapped type is a string forward reference
+            if isinstance(ann, str):
+                logger.warning(
+                    f"Unable to resolve forward reference '{ann}' in Annotated type. "
+                    "For anonymous registration, ensure all type annotations are resolvable."
+                )
+                return None
 
         origin = get_origin(ann)
 
@@ -316,34 +351,76 @@ class ServiceContainer:
             u_args = [a for a in get_args(ann) if a is not type(None)]
             if len(u_args) == 1:
                 ann = u_args[0]
+                # Check if unwrapped type is a string forward reference
+                if isinstance(ann, str):
+                    logger.warning(
+                        f"Unable to resolve forward reference '{ann}' in Optional/Union type. "
+                        "For anonymous registration, ensure all type annotations are resolvable."
+                    )
+                    return None
                 origin = get_origin(ann)
 
         # AsyncGenerator[T, ...] / Generator[T, ...]
         if origin in (AsyncGenerator, AsyncGeneratorABC, GeneratorABC):
             args = get_args(ann)
-            return args[0] if args else None
+            if args:
+                inner_type = args[0]
+                # Reject unresolved string forward references
+                if isinstance(inner_type, str):
+                    logger.warning(
+                        f"Unable to resolve forward reference '{inner_type}' in generator type. "
+                        "For anonymous registration, ensure all type annotations are resolvable."
+                    )
+                    return None
+                return inner_type
+            return None
 
         # Awaitable[T]
         if origin is AwaitableABC:
             args = get_args(ann)
             if args:
+                inner_type = args[0]
+                # Reject unresolved string forward references
+                if isinstance(inner_type, str):
+                    logger.warning(
+                        f"Unable to resolve forward reference '{inner_type}' in Awaitable type. "
+                        "For anonymous registration, ensure all type annotations are resolvable."
+                    )
+                    return None
                 logger.warning(
                     "Return annotation uses Awaitable[T]; prefer annotating async "
                     "factories as `-> T`. Using T as service type."
                 )
-                return args[0]
+                return inner_type
 
         # Coroutine[Any, Any, T]
         if origin is CoroutineABC:
             args = get_args(ann)
             if len(args) == 3:
+                inner_type = args[2]
+                # Reject unresolved string forward references
+                if isinstance(inner_type, str):
+                    logger.warning(
+                        f"Unable to resolve forward reference '{inner_type}' in Coroutine type. "
+                        "For anonymous registration, ensure all type annotations are resolvable."
+                    )
+                    return None
                 logger.warning(
                     "Return annotation uses Coroutine[..., T]; prefer annotating async "
                     "factories as `-> T`. Using T as service type."
                 )
-                return args[2]
+                return inner_type
 
         # Non-generic: treat the annotation itself as the service type.
+        # Reject string annotations (unresolved forward references) to prevent
+        # accidental registration with string keys instead of actual types.
+        if isinstance(ann, str):
+            logger.warning(
+                f"Unable to resolve forward reference '{ann}' to an actual type. "
+                "For anonymous registration, ensure all type annotations are resolvable."
+            )
+            return None
+
         return ann
 
     def _register_type_index(
@@ -357,10 +434,20 @@ class ServiceContainer:
 
         Anonymous registration:
             - Fails if any service (anonymous or named) of the same type already exists.
+            - Fails if service_type is None (cannot infer type).
 
         Named registration:
             - Fails if an anonymous service of the same type already exists.
         """
+        # Anonymous registration requires a valid service type
+        if public_key is None and service_type is None:
+            msg = (
+                "Anonymous service registration failed: unable to infer service type. "
+                "Please provide a type annotation on the factory function or use a named registration."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
         if service_type is None:
             return
 
@@ -481,11 +568,14 @@ class ServiceContainer:
         dtor = service.dtor
         finalizer: Optional[Callable[[], Awaitable[None]]] = None
 
-        # Execute factory (sync or async) in the event loop thread.
-        # If heavy work is needed, prefer an async factory or offload explicitly.
-        result = ctor(*args, **kwargs)
-        if inspect.isawaitable(result):
-            result = await result
+        # Execute factory: async directly, sync in a background thread to avoid blocking.
+        if inspect.iscoroutinefunction(ctor):
+            result = await ctor(*args, **kwargs)
+        else:
+            # Run sync factories in a separate thread to avoid blocking the loop.
+            result = await asyncio.to_thread(ctor, *args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
 
         # Async generator.
         if inspect.isasyncgen(result):
@@ -650,9 +740,8 @@ class ServiceContainer:
                 )
 
             # Update indices first to avoid half-registered services on error.
-            if service_type is not None:
-                self._register_type_index(
-                    service_type, internal_id, public_key)
+            # This will raise an error if anonymous registration has no type
+            self._register_type_index(service_type, internal_id, public_key)
 
             if public_key is not None:
                 self._key_index[public_key] = internal_id
@@ -720,7 +809,7 @@ class ServiceContainer:
         Asynchronously resolve a service instance by key.
 
         This method is intended for internal or low-level use. In FastAPI
-        endpoints, the `inject()` helper should be preferred.
+        endpoints, the `Inject()` helper should be preferred.
         """
         self._ensure_event_loop()
 
@@ -810,10 +899,9 @@ class ServiceContainer:
         return lambda *a, **kw: self.aget_by_key(key, *a, **kw)
 
 
-def inject(
+def Inject(
         target: Any = None,
         *args: Any,
-        _key: Optional[str] = None,
         **kwargs: Any,
 ) -> Depends:
     """
@@ -822,36 +910,30 @@ def inject(
     In endpoints you can write:
 
         @router.get("/items")
-        async def endpoint(db: DbConn = inject(DbConn)):
+        async def endpoint(db: DbConn = Inject(DbConn)):
             ...
 
     Resolution modes
     ----------------
     1. Key-based resolution:
-        - inject("my_key")
-        - inject(target, _key="my_key")  # key parameter takes precedence
+        - Inject("my_key")
 
     2. Type-based resolution:
-        - inject(MyType)
+        - Inject(MyType)
 
        This requires that exactly one service of type MyType is registered.
     """
     # Decide lookup mode.
-    if _key is not None:
+    if isinstance(target, str):
         key_specified = True
-        lookup_value = _key
+        lookup_value = target
+    elif isinstance(target, type):
+        key_specified = False
+        lookup_value = target
     else:
-        if isinstance(target, str):
-            key_specified = True
-            lookup_value = target
-        elif isinstance(target, type):
-            key_specified = False
-            lookup_value = target
-        else:
-            raise TypeError(
-                "inject() expects either a service key (str) or a service type "
-                "when '_key' is not provided."
-            )
+        raise TypeError(
+            "Inject() expects either a service key (str) or a service type."
+        )
 
     # Build the dependency signature.
     params = [
@@ -931,7 +1013,9 @@ def inject(
     else:
         name_suffix = getattr(lookup_value, "__name__", repr(lookup_value))
 
-    _dependency_callable.__name__ = f"inject_{"key" if key_specified else "type"}_{name_suffix}"
+    _dependency_callable.__name__ = (
+        f"inject_{'key' if key_specified else 'type'}_{name_suffix}"
+    )
     _dependency_callable.__qualname__ = _dependency_callable.__name__
     _dependency_callable.__signature__ = sig
 
@@ -944,7 +1028,7 @@ class TransientServiceFinalizerMiddleware:
 
     This middleware should be added to the ASGI app after all other middlewares that may resolve transient services.
 
-    Usage: 
+    Usage:
 
         app.add_middleware(TransientServiceFinalizerMiddleware)
     """
@@ -958,7 +1042,11 @@ class TransientServiceFinalizerMiddleware:
         if services is None:
             return
 
-        state = scope.setdefault("state", {})
+        # scope["state"] is a plain dict, not the State wrapper object.
+        # We must use dict operations directly.
+        state = scope.get("state")
+        if state is None:
+            return
         ctx_key = services._request_ctx_key()
         ctx = state.get(ctx_key)
         if not ctx:
@@ -969,6 +1057,7 @@ class TransientServiceFinalizerMiddleware:
                 await finalizer()
             except Exception:
                 logger.exception("Error running transient finalizer.")
+        # Clean up the context from the state dict
         state.pop(ctx_key, None)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

@@ -10,14 +10,12 @@ from app.services import BaseService
 class ExampleGeneratorServiceT(BaseService):
     class LifespanTasks(BaseService.LifespanTasks):
         @staticmethod
-        async def ctor(msg: str) -> AsyncGenerator[ExampleGeneratorServiceT]:
+        async def ctor(msg: str) -> AsyncGenerator[ExampleGeneratorServiceT, None]:
             # If you want a iterable generator, return it via a method of a service instance
             try:
                 yield ExampleGeneratorServiceT(msg)
             finally:
                 logger.debug("generator finallized")
-
-        dtor = None
 
     msg: str
 

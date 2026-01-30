@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app  # noqa: E402
 
 
 @pytest.fixture
