@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 
 import uvicorn
@@ -10,10 +12,10 @@ def main(args):
         "app:app",
         host=args.host,
         port=args.port,
-        reload=settings.RELOAD,
-        proxy_headers=settings.USE_PROXY_HEADERS,
+        reload=settings.reload,
+        proxy_headers=settings.use_proxy_headers,
         forwarded_allow_ips=(
-            settings.FORWARDED_ALLOW_IPS if settings.USE_PROXY_HEADERS else None
+            settings.forwarded_allow_ips if settings.use_proxy_headers else None
         ),
     )
 

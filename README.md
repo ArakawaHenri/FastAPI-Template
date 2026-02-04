@@ -44,7 +44,8 @@ Settings are loaded via `pydantic-settings` from environment variables and `.env
 - `USE_PROXY_HEADERS`: enable `X-Forwarded-*` handling in uvicorn.
 - `FORWARDED_ALLOW_IPS`: comma-separated list of trusted proxy IPs/hosts.
 - `LOG_DIR`: log output directory (created automatically if missing).
-- `TMP_DIR`, `TMP_RETENTION_DAYS`: reserved for temporary files/cleanup workflows.
+- `TMP_DIR`, `TMP_RETENTION_DAYS`: temp file storage and retention for `TempFileService`.
+- `STORE_LMDB__*`: LMDB store configuration (see notes below).
 - `SEMAPHORES__<name>`: nested config for semaphore services (uses `env_nested_delimiter="__"`).
 
 Use `.env.production_example` and `.env.debug_example` as starting points.
@@ -61,8 +62,10 @@ Use `.env.production_example` and `.env.debug_example` as starting points.
 | `USE_PROXY_HEADERS` | bool | `true` | Set when behind a reverse proxy |
 | `FORWARDED_ALLOW_IPS` | string | `10.0.0.0/8,127.0.0.1` | Trusted proxy IPs/hosts |
 | `LOG_DIR` | string | `./log` | Created automatically |
-| `TMP_DIR` | string | `./tmp` | Reserved |
-| `TMP_RETENTION_DAYS` | int | `3` | Reserved |
+| `TMP_DIR` | string | `./tmp` | Temp file base directory |
+| `TMP_RETENTION_DAYS` | int | `3` | Temp file retention days |
+| `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB store path |
+| `STORE_LMDB__MAX_DBS` | int | `256` | Must be `>= 3` |
 | `SEMAPHORES__db` | int | `5` | Example nested config |
 
 ## Project structure
@@ -77,6 +80,9 @@ app/
 ├── core/                     # Infrastructure
 │   ├── dependencies.py       # ServiceContainer (DI) and inject helper
 │   ├── logger.py             # Loguru setup and stdlib interception
+│   ├── shared/               # Shared utilities (cross-worker)
+│   │   ├── store_cleanup.py  # Store cleanup loop + file lock
+│   │   └── tmpfile_cleanup.py# Temp file cleanup loop + file lock
 │   └── settings.py           # Pydantic settings
 ├── lifespan/                 # Startup/shutdown wiring
 │   └── main.py               # Service registration and teardown
@@ -84,6 +90,8 @@ app/
 │   ├── exception.py          # Error types and handlers
 │   └── logging.py            # Request logging
 ├── services/                 # Business services and examples
+│   ├── store/                # LMDB-backed key-value store
+│   ├── temp_file/            # Temporary file manager
 │   └── base.py               # BaseService and lifecycle contract
 └── main.py                   # FastAPI app factory
 main.py                       # CLI runner for uvicorn
@@ -104,6 +112,21 @@ main.py                       # CLI runner for uvicorn
 - Use `inject("key")` for key-based resolution; use type-based injection only when a single service of that type exists.
 - Do not resolve services outside an event loop or across multiple loops.
 - Singletons should not depend on transients unless explicitly allowed.
+
+### Temporary files
+
+- `TempFileService` (key: `temp_file_service`) manages temporary files under `TMP_DIR`.
+- `save(name, content)` stores text or binary; duplicate names become `filename.1.ext`, `filename.2.ext`, etc.
+- Leading dots are escaped (e.g., `.env` → `%2Eenv`) to avoid hidden files.
+- `read(name)` returns `str` if the original content was text, otherwise `bytes`.
+- Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).
+
+### LMDB store
+
+- `StoreService` (key: `store_service`) provides a local LMDB-backed key-value store with TTL.
+- Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
+- `STORE_LMDB__MAX_DBS` must be `>= 3` to account for data, expiry, and expmeta DBs.
+- Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).
 
 ### Lifespan
 

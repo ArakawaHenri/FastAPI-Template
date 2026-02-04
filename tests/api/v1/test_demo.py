@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 def test_example_endpoint(client):
     """
     Test the /api/v1/example/ endpoint.

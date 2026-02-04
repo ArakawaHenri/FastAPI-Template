@@ -324,11 +324,31 @@ class ServiceContainer:
 
         # Resolve forward references / string annotations / Annotated
         try:
-            hints = get_type_hints(ctor, include_extras=True)
+            try:
+                closure_vars = inspect.getclosurevars(ctor)
+                localns = closure_vars.nonlocals if closure_vars else None
+            except Exception:
+                localns = None
+
+            hints = get_type_hints(ctor, include_extras=True, localns=localns)
             ann = hints.get("return", ann)
         except Exception:
-            # Type hints are best-effort only; never break runtime on failures.
-            pass
+            try:
+                hints = get_type_hints(ctor, include_extras=True)
+                ann = hints.get("return", ann)
+            except Exception:
+                # Type hints are best-effort only; never break runtime on failures.
+                pass
+
+        if isinstance(ann, str):
+            resolved = ServiceContainer._resolve_annotation_str(ann, ctor)
+            if resolved is None:
+                logger.warning(
+                    f"Unable to resolve forward reference '{ann}' to an actual type. "
+                    "For anonymous registration, ensure all type annotations are resolvable."
+                )
+                return None
+            ann = resolved
 
         # Unwrap Annotated[T, ...]
         if get_origin(ann) is Annotated:
@@ -411,17 +431,20 @@ class ServiceContainer:
                 )
                 return inner_type
 
-        # Non-generic: treat the annotation itself as the service type.
-        # Reject string annotations (unresolved forward references) to prevent
-        # accidental registration with string keys instead of actual types.
-        if isinstance(ann, str):
-            logger.warning(
-                f"Unable to resolve forward reference '{ann}' to an actual type. "
-                "For anonymous registration, ensure all type annotations are resolvable."
-            )
-            return None
-
         return ann
+
+    @staticmethod
+    def _resolve_annotation_str(annotation: str, ctor: Ctor) -> Any | None:
+        try:
+            closure_vars = inspect.getclosurevars(ctor)
+            localns = closure_vars.nonlocals if closure_vars else None
+        except Exception:
+            localns = None
+
+        try:
+            return eval(annotation, getattr(ctor, "__globals__", {}), localns or {})
+        except Exception:
+            return None
 
     def _register_type_index(
             self,

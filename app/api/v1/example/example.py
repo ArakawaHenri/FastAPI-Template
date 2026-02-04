@@ -3,6 +3,7 @@ Example demonstrating how to use custom exceptions in your API endpoints.
 
 This file shows best practices and error handling in FastAPI applications.
 """
+from __future__ import annotations
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse

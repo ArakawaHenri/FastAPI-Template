@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextvars
 import logging
 import sys
@@ -6,7 +8,8 @@ from pathlib import Path
 from loguru import logger
 
 # Context variable for request tracing across async calls
-request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-")
 
 
 class InterceptHandler(logging.Handler):
@@ -26,12 +29,12 @@ class InterceptHandler(logging.Handler):
         )
 
 
-def setup_logging(log_dir: str, debug: bool):
+def setup_logging(log_dir: Path, debug: bool):
     logger.remove()
 
     console_level = "DEBUG" if debug else "INFO"
 
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     logger.add(
         sys.stderr,

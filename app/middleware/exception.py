@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any
 
 from fastapi import Request, status
@@ -118,7 +120,7 @@ def create_error_response(
     if details:
         content["error"]["details"] = details
 
-    if settings.DEBUG_MODE and request_path:
+    if settings.debug_mode and request_path:
         content["error"]["path"] = request_path
 
     return JSONResponse(status_code=status_code, content=content)
@@ -143,7 +145,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     details = {"validation_errors": formatted_errors}
 
     # Include request body only in debug mode
-    if settings.DEBUG_MODE:
+    if settings.debug_mode:
         details["body"] = exc.body
 
     return create_error_response(
@@ -210,7 +212,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
     # Re-raise in development to show detailed errors
-    if settings.DEBUG_MODE:
+    if settings.debug_mode:
         raise
 
     # Return generic error in production

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -11,6 +13,24 @@ class DatabaseSettings(BaseModel):
     pool_pre_ping: bool = True  # Check connection validity before use
 
 
+class StoreLMDBSettings(BaseModel):
+    """Configuration for LMDB key-value store."""
+    path: str = "./store_lmdb"
+    map_size_mb: int = 1024
+    map_size_growth_factor: int = 2
+    map_high_watermark: float = 0.9
+    max_dbs: int = 256
+    max_readers: int = 512
+    sync: bool = False
+    metasync: bool = True
+    writemap: bool = True
+    map_async: bool = True
+    max_key_bytes: int = 256
+    max_namespace_bytes: int = 256
+    max_value_bytes: int = 100 * 1024 * 1024
+    cleanup_max_deletes: int = 100_000
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -22,19 +42,19 @@ class Settings(BaseSettings):
     app_name: str = "fastapi_app"
     app_version: str = "1.0.0"
 
-    LOG_DIR: str = "./logs"
-    TMP_DIR: str = "./tmp"
-    TMP_RETENTION_DAYS: int = 3
-    DEBUG_MODE: bool = False
-    RELOAD: bool = False
-    USE_PROXY_HEADERS: bool = False
-    FORWARDED_ALLOW_IPS: str = Field(
+    log_dir: str = "./logs"
+    tmp_dir: str = "./tmp"
+    tmp_retention_days: int = 3
+    debug_mode: bool = False
+    reload: bool = False
+    use_proxy_headers: bool = False
+    forwarded_allow_ips: str = Field(
         default="127.0.0.1",
         description="Comma-separated list of trusted proxy IPs/hosts for X-Forwarded-*"
     )
 
     # CORS configuration
-    CORS_ORIGINS: list[str] = Field(
+    cors_origins: list[str] = Field(
         default=[],
         description="Allowed CORS origins"
     )
@@ -44,12 +64,16 @@ class Settings(BaseSettings):
 
     semaphores: dict[str, int] = Field(default_factory=dict)
 
+    # Store (zLMDB key-value) configuration
+    store_lmdb: StoreLMDBSettings = Field(default_factory=StoreLMDBSettings)
+
     @field_validator('semaphores')
     @classmethod
     def validate_semaphores(cls, v):
         for key, value in v.items():
             if value < 1:
-                raise ValueError(f"Semaphore '{key}' must be >= 1, got {value}")
+                raise ValueError(
+                    f"Semaphore '{key}' must be >= 1, got {value}")
         return v
 
 

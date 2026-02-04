@@ -44,7 +44,8 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `USE_PROXY_HEADERS`：在 uvicorn 中启用 `X-Forwarded-*` 处理。
 - `FORWARDED_ALLOW_IPS`：可信代理 IP/Host 列表，逗号分隔。
 - `LOG_DIR`：日志目录（不存在会自动创建）。
-- `TMP_DIR`, `TMP_RETENTION_DAYS`：预留临时目录/清理策略。
+- `TMP_DIR`, `TMP_RETENTION_DAYS`：临时文件存储与保留时间（`TempFileService`）。
+- `STORE_LMDB__*`：LMDB 存储配置（见下方说明）。
 - `SEMAPHORES__<name>`：信号量配置（使用 `env_nested_delimiter="__"`）。
 
 可参考 `.env.production_example` 与 `.env.debug_example`。
@@ -61,8 +62,10 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `USE_PROXY_HEADERS` | bool | `true` | 反向代理后启用 |
 | `FORWARDED_ALLOW_IPS` | string | `10.0.0.0/8,127.0.0.1` | 可信代理 IP/Host |
 | `LOG_DIR` | string | `./log` | 自动创建 |
-| `TMP_DIR` | string | `./tmp` | 预留 |
-| `TMP_RETENTION_DAYS` | int | `3` | 预留 |
+| `TMP_DIR` | string | `./tmp` | 临时文件目录 |
+| `TMP_RETENTION_DAYS` | int | `3` | 临时文件保留天数 |
+| `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB 存储路径 |
+| `STORE_LMDB__MAX_DBS` | int | `256` | 必须 `>= 3` |
 | `SEMAPHORES__db` | int | `5` | 嵌套配置示例 |
 
 ## 项目结构
@@ -77,6 +80,9 @@ app/
 ├── core/                     # 基础设施
 │   ├── dependencies.py       # ServiceContainer (DI) 与 inject
 │   ├── logger.py             # loguru 配置与标准库拦截
+│   ├── shared/               # 跨 worker 共享工具
+│   │   ├── store_cleanup.py  # Store 清理循环 + 文件锁
+│   │   └── tmpfile_cleanup.py# Temp 文件清理循环 + 文件锁
 │   └── settings.py           # 配置读取
 ├── lifespan/                 # 启动/关闭流程
 │   └── main.py               # 服务注册与释放
@@ -84,6 +90,8 @@ app/
 │   ├── exception.py          # 错误类型与处理
 │   └── logging.py            # 请求日志
 ├── services/                 # 业务服务与示例
+│   ├── store/                # LMDB 键值存储
+│   ├── temp_file/            # 临时文件管理
 │   └── base.py               # BaseService 与生命周期约定
 └── main.py                   # FastAPI 应用入口
 main.py                       # uvicorn 启动脚本
@@ -104,6 +112,21 @@ main.py                       # uvicorn 启动脚本
 - `inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
 - 不要跨事件循环或线程使用 `ServiceContainer`。
 - 除特别设置外，单例默认不依赖瞬态服务。
+
+### 临时文件
+
+- `TempFileService`（key: `temp_file_service`）在 `TMP_DIR` 下管理临时文件。
+- `save(name, content)` 保存文本或二进制；重名自动写为 `filename.1.ext`、`filename.2.ext`。
+- 以 `.` 开头的文件名会被转义（如 `.env` → `%2Eenv`），避免隐藏文件。
+- `read(name)`：文本返回 `str`，二进制返回 `bytes`。
+- 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。
+
+### LMDB 存储
+
+- `StoreService`（key: `store_service`）提供本地 LMDB KV + TTL。
+- 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
+- `STORE_LMDB__MAX_DBS` 必须 `>= 3`。
+- 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。
 
 ### Lifespan
 
