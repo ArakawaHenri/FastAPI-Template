@@ -245,11 +245,31 @@ class StoreService(BaseService):
         return StoreService._ExclusiveNamespaceLock(self, namespace)
 
     async def mark_internal_namespace(self, namespace: str) -> None:
+        """
+        Mark a namespace as internal, excluding it from user quota counting.
+
+        If the namespace is already registered, it will be migrated to internal
+        and no longer count against user quota for future capacity checks.
+
+        Args:
+            namespace: The namespace to mark as internal
+        """
         self._assert_open()
         self._assert_not_in_callback()
         self._encode_namespace(namespace)
         async with self._namespace_lock:
+            already_registered = namespace in self._namespaces
             self._internal_namespaces.add(namespace)
+            if already_registered:
+                logger.info(
+                    f"[STORE] Migrated existing namespace '{namespace}' to internal. "
+                    f"It will no longer count against user quota."
+                )
+            else:
+                logger.debug(
+                    f"[STORE] Pre-marked namespace '{namespace}' as internal "
+                    f"(not yet registered)"
+                )
 
     async def start_cleanup(self) -> None:
         self._assert_open()

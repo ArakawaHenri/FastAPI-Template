@@ -348,6 +348,29 @@ async def test_internal_namespace_not_counted_for_user_quota(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_internal_namespace_migration_after_registration(tmp_path):
+    """Test that mark_internal_namespace can migrate an already-registered namespace"""
+    store = _make_store(tmp_path, max_dbs=2)
+
+    # First, use a namespace (registers it as user namespace)
+    await store.set("tmp_files", "k1", "v1", retention=10)
+    await store.set("user_ns", "k", "v", retention=10)
+
+    # Now mark tmp_files as internal - should migrate it
+    await store.mark_internal_namespace("tmp_files")
+
+    # Should still be able to create another user namespace since tmp_files no longer counts
+    await store.set("another_user_ns", "k", "v", retention=10)
+
+    # Verify the data is still accessible
+    assert await store.get("tmp_files", "k1") == "v1"
+    assert await store.get("user_ns", "k") == "v"
+    assert await store.get("another_user_ns", "k") == "v"
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_store_multiworker_stability(tmp_path):
     db_path = tmp_path / "store_lmdb"
     ctx = get_context("spawn")
