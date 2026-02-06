@@ -216,6 +216,9 @@ async def test_leading_dot_is_escaped(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_temp_dir_and_files_permissions_are_restricted(tmp_path: Path):
+    if os.name != "posix":
+        pytest.skip("permission mode checks require posix")
+
     service, store = await _make_service(tmp_path)
     name = await service.save("perm.txt", "secret")
 
