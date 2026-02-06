@@ -12,10 +12,16 @@ venv
 
 # Logs and temp files
 __pycache__
+__pycache__/
 *.log
 *.tmp
 logs/
 tmp/
+store_lmdb/
+*.mdb
+*.mdb-lock
+lock.mdb
+.ruff_cache/
 
 # Testing
 .pytest_cache/

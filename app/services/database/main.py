@@ -60,7 +60,8 @@ class DatabaseEngineService(BaseService):
         parsed = urlparse(url)
         db_name = parsed.path.rstrip("/").split("/")[-1] if parsed.path else ""
         if not db_name:
-            raise ValueError(f"Invalid database URL: missing database name ({url!r})")
+            raise ValueError(
+                f"Invalid database URL: missing database name ({url!r})")
 
         self.url = url
         self.pool_size = pool_size
@@ -116,7 +117,13 @@ class DatabaseSessionServiceT(BaseService):
     Yields an AsyncSession with automatic commit/rollback.
 
     Usage in endpoints:
-        session: AsyncSession = inject(DatabaseSessionServiceT, inject("main_database_service"))
+        session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))
+
+    Note:
+        ServiceContainer infers the injectable service type from the
+        factory return annotation. Since ctor returns
+        AsyncGenerator[AsyncSession, None], type-based injection target
+        is AsyncSession (not DatabaseSessionServiceT).
     """
 
     class LifespanTasks(BaseService.LifespanTasks):
@@ -125,7 +132,7 @@ class DatabaseSessionServiceT(BaseService):
             """
             Async generator factory for database sessions.
 
-            The engine is injected via nested inject() at endpoint resolution.
+            The engine is injected via nested Inject() at endpoint resolution.
             """
             async with engine.async_sessionmaker() as session:
                 try:

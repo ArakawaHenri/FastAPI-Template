@@ -1,5 +1,5 @@
 # Build stage
-FROM python:3.12-slim as builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Production stage
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -35,6 +35,7 @@ RUN mkdir -p /app/logs /app/tmp
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONJIT=1 \
     ENVIRONMENT=production
 
 # Create non-root user
@@ -47,8 +48,11 @@ EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/')"
 
-# Run with uvicorn (single process)
-# For production, consider using Gunicorn with Uvicorn workers
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run with granian (configurable host/port/workers)
+# Example: docker run -e PORT=9000 -e WORKERS=4 ...
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    WORKERS=1
+CMD ["sh", "-c", "granian --interface asgi --host ${HOST} --port ${PORT} --workers ${WORKERS} app.main:app"]

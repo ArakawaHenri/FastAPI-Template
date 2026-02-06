@@ -1,8 +1,6 @@
 """Tests for middleware functionality"""
 from __future__ import annotations
 
-import pytest
-
 
 class TestRequestLoggingMiddleware:
     """Tests for RequestLoggingMiddleware"""

@@ -19,8 +19,11 @@ from app.services.transient_example import ExampleServiceT
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logging_initialized = False
+    services: ServiceContainer | None = None
     try:
         setup_logging(Path(settings.log_dir), settings.debug_mode)
+        logging_initialized = True
 
         # Production configuration validation
         if not settings.debug_mode:
@@ -36,7 +39,8 @@ async def lifespan(app: FastAPI):
 
         logger.debug("[LIFESPAN] Initialising service container...")
 
-        app.state.services = ServiceContainer()
+        services = ServiceContainer()
+        app.state.services = services
 
         logger.debug("[LIFESPAN] Registering services...")
 
@@ -54,7 +58,8 @@ async def lifespan(app: FastAPI):
             )
 
         # Register generic session transient (use nested inject to specify engine)
-        # Usage: inject(DatabaseSessionServiceT, inject("main_database_service"))
+        # Usage: Inject(AsyncSession, Inject("main_database_service"))
+        # ServiceContainer infers type from ctor return annotation.
         await app.state.services.register(
             None,  # Anonymous, resolve by type
             ServiceLifetime.TRANSIENT,
@@ -106,9 +111,9 @@ async def lifespan(app: FastAPI):
             settings.store_lmdb.max_namespace_bytes,
             settings.store_lmdb.max_value_bytes,
             settings.store_lmdb.cleanup_max_deletes,
+            settings.store_lmdb.worker_threads,
         )
         store_service: StoreService = await app.state.services.aget_by_key("store_service")
-        await store_service.start_cleanup()
 
         # Temp file manager (singleton per worker)
         await app.state.services.register(
@@ -118,21 +123,29 @@ async def lifespan(app: FastAPI):
             TempFileService.LifespanTasks.dtor,
             settings.tmp_dir,
             settings.tmp_retention_days,
+            settings.tmp_cleanup_interval_seconds,
+            settings.tmp_worker_threads,
+            settings.tmp_max_file_size_mb,
+            settings.tmp_max_total_size_mb,
+            store_provider=app.state.services.require("store_service"),
         )
         temp_file_service: TempFileService = await app.state.services.aget_by_key("temp_file_service")
         await temp_file_service.start_cleanup()
+        await store_service.start_cleanup()
 
         yield
 
     finally:
         logger.debug("[LIFESPAN] Shutting down...")
 
-        await app.state.services.destruct_all_singletons()
-
-        app.state.services = None
-
-        logger.debug("[LIFESPAN] Service container released.")
+        active_services = services or getattr(app.state, "services", None)
+        if active_services is not None:
+            await active_services.destruct_all_singletons()
+            app.state.services = None
+            logger.debug("[LIFESPAN] Service container released.")
+        else:
+            logger.debug("[LIFESPAN] Service container was not initialized.")
 
         logger.debug("[LIFESPAN] Application shutdown completed.")
-
-        await shutdown_logging()
+        if logging_initialized:
+            await shutdown_logging()

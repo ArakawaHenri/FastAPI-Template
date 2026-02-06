@@ -1,3 +1,3 @@
-from .main import StoreService
+from .main import ExpiryCallbackEvent, StoreService
 
-__all__ = ["StoreService"]
+__all__ = ["StoreService", "ExpiryCallbackEvent"]

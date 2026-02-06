@@ -29,6 +29,7 @@ class StoreLMDBSettings(BaseModel):
     max_namespace_bytes: int = 256
     max_value_bytes: int = 100 * 1024 * 1024
     cleanup_max_deletes: int = 100_000
+    worker_threads: int = 4
 
 
 class Settings(BaseSettings):
@@ -45,13 +46,12 @@ class Settings(BaseSettings):
     log_dir: str = "./logs"
     tmp_dir: str = "./tmp"
     tmp_retention_days: int = 3
+    tmp_cleanup_interval_seconds: int = 60
+    tmp_worker_threads: int = 4
+    tmp_max_file_size_mb: int = 1024
+    tmp_max_total_size_mb: int = 0
     debug_mode: bool = False
     reload: bool = False
-    use_proxy_headers: bool = False
-    forwarded_allow_ips: str = Field(
-        default="127.0.0.1",
-        description="Comma-separated list of trusted proxy IPs/hosts for X-Forwarded-*"
-    )
 
     # CORS configuration
     cors_origins: list[str] = Field(
@@ -70,11 +70,19 @@ class Settings(BaseSettings):
     @field_validator('semaphores')
     @classmethod
     def validate_semaphores(cls, v):
+        normalized: dict[str, int] = {}
         for key, value in v.items():
+            normalized_key = key.lower()
             if value < 1:
                 raise ValueError(
                     f"Semaphore '{key}' must be >= 1, got {value}")
-        return v
+            normalized[normalized_key] = value
+        return normalized
+
+    @field_validator("database")
+    @classmethod
+    def normalize_database_keys(cls, v):
+        return {key.lower(): value for key, value in v.items()}
 
 
 settings = Settings()

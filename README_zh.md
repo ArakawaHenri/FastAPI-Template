@@ -27,11 +27,24 @@ cp .env.production_example .env
 
 ```bash
 # 开发模式
-uv run fastapi dev app/main.py
+uv run python main.py --host 0.0.0.0 --port 8000
 
 # 生产模式
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+uv run python main.py --host 0.0.0.0 --port 8000 --workers 1
 ```
+
+## 运行时说明
+
+- 生产运行时默认使用 `granian`。
+- `main.py` 会启动 granian，并读取配置中的 `RELOAD` 开关。
+- Granian 在 CPython 3.14t 下提供实验性的 free-threading 支持。
+
+```bash
+uv sync --python 3.14t
+uv run python main.py --host 0.0.0.0 --port 8000
+```
+
+- 3.14t 模式属于实验性能力，请在生产上线前对实际业务负载做充分验证。
 
 ## 配置说明
 
@@ -41,12 +54,11 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `DEBUG_MODE`：为 true 时校验错误会返回请求体，未捕获异常会直接抛出。
 - `RELOAD`：开发用热重载开关。
 - `CORS_ORIGINS`：允许来源列表，JSON 数组格式（示例：`["https://example.com"]`）。
-- `USE_PROXY_HEADERS`：在 uvicorn 中启用 `X-Forwarded-*` 处理。
-- `FORWARDED_ALLOW_IPS`：可信代理 IP/Host 列表，逗号分隔。
 - `LOG_DIR`：日志目录（不存在会自动创建）。
-- `TMP_DIR`, `TMP_RETENTION_DAYS`：临时文件存储与保留时间（`TempFileService`）。
+- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`：临时文件存储、保留时间及大小上限（`TempFileService`）。
 - `STORE_LMDB__*`：LMDB 存储配置（见下方说明）。
 - `SEMAPHORES__<name>`：信号量配置（使用 `env_nested_delimiter="__"`）。
+- `DATABASE__<name>__*`：数据库嵌套配置。示例默认使用 MySQL + `aiomysql`。
 
 可参考 `.env.production_example` 与 `.env.debug_example`。
 
@@ -59,14 +71,16 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `DEBUG_MODE` | bool | `false` | 生产必须为 `false` |
 | `RELOAD` | bool | `false` | 仅开发环境 |
 | `CORS_ORIGINS` | JSON list | `["https://example.com"]` | 空数组禁用 CORS |
-| `USE_PROXY_HEADERS` | bool | `true` | 反向代理后启用 |
-| `FORWARDED_ALLOW_IPS` | string | `10.0.0.0/8,127.0.0.1` | 可信代理 IP/Host |
 | `LOG_DIR` | string | `./log` | 自动创建 |
 | `TMP_DIR` | string | `./tmp` | 临时文件目录 |
 | `TMP_RETENTION_DAYS` | int | `3` | 临时文件保留天数 |
+| `TMP_MAX_FILE_SIZE_MB` | int | `1024` | 单个临时文件大小上限（`0` 表示不限） |
+| `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | 临时目录总大小上限（`0` 表示不限） |
+| `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | SQLAlchemy 异步连接串 |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB 存储路径 |
 | `STORE_LMDB__MAX_DBS` | int | `256` | 必须 `>= 3` |
 | `SEMAPHORES__db` | int | `5` | 嵌套配置示例 |
+| `SEMAPHORES__example` | int | `10` | `/api/v1/example/` 示例路由使用 |
 
 ## 项目结构
 
@@ -80,9 +94,6 @@ app/
 ├── core/                     # 基础设施
 │   ├── dependencies.py       # ServiceContainer (DI) 与 inject
 │   ├── logger.py             # loguru 配置与标准库拦截
-│   ├── shared/               # 跨 worker 共享工具
-│   │   ├── store_cleanup.py  # Store 清理循环 + 文件锁
-│   │   └── tmpfile_cleanup.py# Temp 文件清理循环 + 文件锁
 │   └── settings.py           # 配置读取
 ├── lifespan/                 # 启动/关闭流程
 │   └── main.py               # 服务注册与释放
@@ -91,10 +102,14 @@ app/
 │   └── logging.py            # 请求日志
 ├── services/                 # 业务服务与示例
 │   ├── store/                # LMDB 键值存储
+│   │   ├── main.py           # Store 领域逻辑
+│   │   └── _runtime.py       # Store 独立运行时辅助（线程池/锁）
 │   ├── temp_file/            # 临时文件管理
+│   │   ├── main.py           # 临时文件领域逻辑
+│   │   └── _runtime.py       # TempFile 独立运行时辅助
 │   └── base.py               # BaseService 与生命周期约定
 └── main.py                   # FastAPI 应用入口
-main.py                       # uvicorn 启动脚本
+main.py                       # granian 启动脚本
 ```
 
 ## 编程规范与引导
@@ -102,20 +117,24 @@ main.py                       # uvicorn 启动脚本
 ### API 层
 
 - Handler 保持轻量，业务逻辑放在 service 中。
-- 使用 `inject(...)` 获取服务，避免在 handler 内自行构造依赖。
+- 使用 `Inject(...)` 获取服务，避免在 handler 内自行构造依赖。
 - 使用 `app/middleware/exception.py` 中的异常类型统一错误响应。
 
 ### 服务与依赖注入
 
 - 命名规范：单例以 `Service` 结尾，瞬态以 `ServiceT` 结尾。
 - 在 `app/lifespan/main.py` 注册服务并明确 key，建议优先使用 key。
-- `inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
+- `Inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
+- 类型注入时，`ServiceContainer` 会以工厂函数（`ctor`）的返回注解作为服务类型。
+- Session 示例：`session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`。
 - 不要跨事件循环或线程使用 `ServiceContainer`。
 - 除特别设置外，单例默认不依赖瞬态服务。
 
 ### 临时文件
 
 - `TempFileService`（key: `temp_file_service`）在 `TMP_DIR` 下管理临时文件。
+- `TMP_MAX_FILE_SIZE_MB` 会限制 `save/read` 的单文件最大大小（`0` 表示不限）。
+- `TMP_MAX_TOTAL_SIZE_MB` 会限制临时目录写入总容量（`0` 表示不限）。
 - `save(name, content)` 保存文本或二进制；重名自动写为 `filename.1.ext`、`filename.2.ext`。
 - 以 `.` 开头的文件名会被转义（如 `.env` → `%2Eenv`），避免隐藏文件。
 - `read(name)`：文本返回 `str`，二进制返回 `bytes`。
@@ -152,8 +171,16 @@ main.py                       # uvicorn 启动脚本
 
 ### 并发模型
 
-- `ServiceContainer` 非线程安全，仅支持单事件循环。
-- 不建议单实例多进程；通过多实例（Docker/K8s）水平扩展。
+- 支持多 worker，但需要满足约束条件。
+- 每个 worker 进程都有自己的 asyncio 事件循环，并在 lifespan 启动时创建自己的 `ServiceContainer`。
+- 不要在 worker 之间共享内存态服务实例；只共享外部状态（LMDB/文件/数据库）。
+- 后台清理循环和回调分发通过文件锁进行主 worker 选举，同一时刻最多一个 worker 执行对应循环。
+- 过期回调名称必须是确定性的，并且在所有 worker 中保持一致。
+- 每个 worker 启动时都必须注册相同的回调名称。
+- 过期回调函数应实现幂等；worker 重启/崩溃恢复后可能出现回放执行。
+- 如果某个 worker 没有注册对应回调名，事件会被跳过并记录为 `error` 日志。
+- `TempFileService` 使用按 namespace 派生的稳定回调名（`tmp_file_cleanup:<namespace>`）；共享同一临时文件域的 worker 必须使用同一 namespace。
+- worker 数量建议适中，优先通过增加实例/副本进行扩展。
 
 ### 测试
 
@@ -227,22 +254,24 @@ if "@" not in email:
 
 - 在业务层抛出异常，API 层保持简洁。
 - 为异常提供 `details`，便于客户端处理。
-- 合理选择日志等级（预期错误用 `warning`，非预期错误用 `exception`）。
+- 合理选择日志等级（可恢复的业务失败使用 `warning`/`error`，非预期故障使用 `exception`）。
 
 ## 部署检查清单
 
 - 确认 `DEBUG_MODE=false` 与 `RELOAD=false`。
 - 显式配置 `CORS_ORIGINS` 或保持为空。
-- 若有代理，设置 `USE_PROXY_HEADERS=true` 并配置 `FORWARDED_ALLOW_IPS`。
 - 移除 `/api/v1/example` 示例路由。
 - 确保 `LOG_DIR` 具备写权限。
 - 如使用 `TMP_DIR`，明确清理策略。
+- 多 worker 部署时，确保所有 worker 的 temp-file namespace 与 store callback 配置一致。
+- 多 worker 部署时，确保每个 worker 在对外提供流量前都完成回调注册。
 - 部署前运行 `PYTHONPATH=. uv run pytest`。
 
 ## 注意点
 
 - `/api/v1/example` 仅用于参考，生产应移除。
 - `CORS_ORIGINS` 默认为空，需显式配置。
-- 仅在可信代理后启用 `USE_PROXY_HEADERS`，并配置 `FORWARDED_ALLOW_IPS`。
 - `DEBUG_MODE=true` 会回显请求体，生产必须禁用。
 - 在请求上下文之外解析瞬态服务时，析构器不会自动执行。
+- 临时文件容量超限（`TMP_MAX_FILE_SIZE_MB`、`TMP_MAX_TOTAL_SIZE_MB`）会记录 `error` 并向调用方抛出 `ValueError`，但不会导致服务退出。
+- 活跃 worker 中缺少对应过期回调名时会记录 `error`；请确保所有 worker 回调注册一致。

@@ -18,7 +18,7 @@ class BaseService(ABC):
             raise NotImplementedError
 
         @staticmethod
-        async def dtor(instance: BaseService) -> None:
+        async def dtor(instance: BaseService) -> None:  # noqa: B027
             """Override for cleanup. Default is no-op."""
             pass
 

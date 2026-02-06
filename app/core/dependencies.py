@@ -608,7 +608,7 @@ class ServiceContainer:
             except StopAsyncIteration:
                 raise RuntimeError(
                     f"Async generator service '{key_label}' did not yield a value."
-                )
+                )  # noqa: B904
 
             async def _close_gen() -> None:
                 await agen.aclose()
@@ -638,7 +638,7 @@ class ServiceContainer:
             except StopIteration:
                 msg = f"Generator service '{key_label}' did not yield a value."
                 logger.error(msg)
-                raise RuntimeError(msg)
+                raise RuntimeError(msg)  # noqa: B904
 
             async def _close_gen() -> None:
                 await asyncio.to_thread(gen.close)

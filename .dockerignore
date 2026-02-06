@@ -22,7 +22,12 @@ logs/
 tmp/
 *.tmp
 
+# Store
+store_lmdb/
+*.mdb
+
 # Testing
+tests/
 .pytest_cache/
 .coverage
 htmlcov/

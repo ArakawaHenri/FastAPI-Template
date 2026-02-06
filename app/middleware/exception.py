@@ -10,7 +10,6 @@ from starlette.exceptions import HTTPException
 
 from app.core.settings import settings
 
-
 # =============================================================================
 # Custom Exception Classes
 # =============================================================================
@@ -20,7 +19,7 @@ class AppException(Exception):
     def __init__(
         self,
         message: str,
-        status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR, 
+        status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
         error_code: str = "INTERNAL_ERROR",
         details: dict[str, Any] | None = None
     ):

@@ -94,14 +94,14 @@ async def get_user(user_id: int):
     """Example of proper error handling in a real endpoint"""
     # Simulate database lookup
     user = await fetch_user_from_db(user_id)
-    
+
     if user is None:
         raise NotFoundException("User", user_id)
-    
+
     # Check permissions (example)
     if not user.get("is_active"):
         raise ForbiddenException("User account is inactive")
-    
+
     return user
 
 

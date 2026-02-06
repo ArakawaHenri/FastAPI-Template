@@ -40,7 +40,12 @@ def setup_logging(log_dir: Path, debug: bool):
         sys.stderr,
         level=console_level,
         colorize=True,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan> - "
+            "<level>{message}</level>"
+        ),
     )
 
     log_file_path = Path(log_dir) / "app_{time}.log"
@@ -53,7 +58,10 @@ def setup_logging(log_dir: Path, debug: bool):
     logger.add(
         log_file_path,
         level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {extra[request_id]} | {name}:{function}:{line} | {message}",
+        format=(
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+            "{extra[request_id]} | {name}:{function}:{line} | {message}"
+        ),
         rotation="00:00",
         retention="7 days",
         compression="zip",
