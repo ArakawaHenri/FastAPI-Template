@@ -74,7 +74,7 @@ class ServiceContainer:
       serialized via an internal async lock (`self._lock`).
       The body of `register()` does **not await** while holding the lock, so
       updates are atomic with respect to other coroutines in the same loop.
-    * Read operations (`aget()`, `aget_by_type()`) are lock-free for better
+    * Read operations (`aget_by_key()`, `aget_by_type()`) are lock-free for better
       throughput, but guarded by a lightweight event-loop consistency check.
 
     IMPORTANT:
@@ -779,7 +779,7 @@ class ServiceContainer:
     def request_kwarg_name(self) -> str:
         """
         Name of the keyword argument used when passing the Request object
-        into aget/aget_by_type calls, for attaching transient finalizers.
+        into service-resolution calls, for attaching transient finalizers.
         """
         return f"_svc_request_{id(self)}"
 

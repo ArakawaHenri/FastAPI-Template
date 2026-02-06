@@ -123,7 +123,7 @@ main.py                       # granian 启动脚本
 ### 服务与依赖注入
 
 - 命名规范：单例以 `Service` 结尾，瞬态以 `ServiceT` 结尾。
-- 在 `app/lifespan/main.py` 注册服务并明确 key，建议优先使用 key。
+- 在 `app/lifespan/main.py` 注册服务时，可使用 key 或匿名按类型注册。
 - `Inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
 - 类型注入时，`ServiceContainer` 会以工厂函数（`ctor`）的返回注解作为服务类型。
 - Session 示例：`session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`。
@@ -132,7 +132,7 @@ main.py                       # granian 启动脚本
 
 ### 临时文件
 
-- `TempFileService`（key: `temp_file_service`）在 `TMP_DIR` 下管理临时文件。
+- `TempFileService`（匿名注册，按 `TempFileService` 类型解析）在 `TMP_DIR` 下管理临时文件。
 - `TMP_MAX_FILE_SIZE_MB` 会限制 `save/read` 的单文件最大大小（`0` 表示不限）。
 - `TMP_MAX_TOTAL_SIZE_MB` 会限制临时目录写入总容量（`0` 表示不限）。
 - `save(name, content)` 保存文本或二进制；重名自动写为 `filename.1.ext`、`filename.2.ext`。
@@ -142,7 +142,7 @@ main.py                       # granian 启动脚本
 
 ### LMDB 存储
 
-- `StoreService`（key: `store_service`）提供本地 LMDB KV + TTL。
+- `StoreService`（匿名注册，按 `StoreService` 类型解析）提供本地 LMDB KV + TTL。
 - 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
 - `STORE_LMDB__MAX_DBS` 必须 `>= 3`。
 - 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。

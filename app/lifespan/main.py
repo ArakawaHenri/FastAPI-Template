@@ -44,9 +44,6 @@ async def lifespan(app: FastAPI):
 
         logger.debug("[LIFESPAN] Registering services...")
 
-        # Keys for singleton services should be named with suffix `_service`
-        # Keys for transient services should be named with suffix `_transient`
-
         # Register database engines for each configured database
         for key, db_config in settings.database.items():
             await app.state.services.register(
@@ -91,9 +88,9 @@ async def lifespan(app: FastAPI):
             ExampleGeneratorServiceT.LifespanTasks.dtor
         )
 
-        # LMDB key-value store service (singleton per worker)
+        # LMDB key-value store service (singleton per worker, resolve by type)
         await app.state.services.register(
-            "store_service",
+            None,
             ServiceLifetime.SINGLETON,
             StoreService.LifespanTasks.ctor,
             StoreService.LifespanTasks.dtor,
@@ -113,11 +110,11 @@ async def lifespan(app: FastAPI):
             settings.store_lmdb.cleanup_max_deletes,
             settings.store_lmdb.worker_threads,
         )
-        store_service: StoreService = await app.state.services.aget_by_key("store_service")
+        store_service: StoreService = await app.state.services.aget_by_type(StoreService)
 
-        # Temp file manager (singleton per worker)
+        # Temp file manager (singleton per worker, resolve by type)
         await app.state.services.register(
-            "temp_file_service",
+            None,
             ServiceLifetime.SINGLETON,
             TempFileService.LifespanTasks.ctor,
             TempFileService.LifespanTasks.dtor,
@@ -127,9 +124,11 @@ async def lifespan(app: FastAPI):
             settings.tmp_worker_threads,
             settings.tmp_max_file_size_mb,
             settings.tmp_max_total_size_mb,
-            store_provider=app.state.services.require("store_service"),
+            store_provider=lambda: app.state.services.aget_by_type(StoreService),
         )
-        temp_file_service: TempFileService = await app.state.services.aget_by_key("temp_file_service")
+        temp_file_service: TempFileService = await app.state.services.aget_by_type(
+            TempFileService
+        )
         await temp_file_service.start_cleanup()
         await store_service.start_cleanup()
 

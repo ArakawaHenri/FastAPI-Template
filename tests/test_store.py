@@ -22,7 +22,7 @@ def _make_store(
     return StoreService(
         StoreConfig(
             path=str(tmp_path / "store_lmdb"),
-            map_size_mb=64,
+            map_size_mb=16,
             map_size_growth_factor=2,
             map_high_watermark=0.9,
             max_dbs=max_dbs,
@@ -33,7 +33,7 @@ def _make_store(
             map_async=True,
             max_key_bytes=256,
             max_namespace_bytes=256,
-            max_value_bytes=10 * 1024 * 1024,
+            max_value_bytes=2 * 1024 * 1024,
             cleanup_max_deletes=cleanup_max_deletes,
             worker_threads=4,
         )
@@ -45,7 +45,7 @@ def _worker_main(db_path: str, worker_id: int, start_event, error_queue):
         store = StoreService(
             StoreConfig(
                 path=str(Path(db_path)),
-                map_size_mb=64,
+                map_size_mb=16,
                 map_size_growth_factor=2,
                 map_high_watermark=0.9,
                 max_dbs=128,
@@ -56,7 +56,7 @@ def _worker_main(db_path: str, worker_id: int, start_event, error_queue):
                 map_async=True,
                 max_key_bytes=256,
                 max_namespace_bytes=256,
-                max_value_bytes=10 * 1024 * 1024,
+                max_value_bytes=2 * 1024 * 1024,
                 cleanup_max_deletes=10_000,
                 worker_threads=4,
             )
@@ -283,7 +283,7 @@ async def test_store_size_limits(tmp_path):
     with pytest.raises(ValueError):
         await store.set(long_ns, "k", "v", retention=10)
 
-    big_value = "x" * (11 * 1024 * 1024)
+    big_value = "x" * (3 * 1024 * 1024)
     with pytest.raises(ValueError):
         await store.set("default", "k", big_value, retention=10)
 

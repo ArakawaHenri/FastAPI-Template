@@ -25,6 +25,8 @@ os.environ.update(
         "DATABASE": "{}",
         "SEMAPHORES": '{"example": 3}',
         "STORE_LMDB__PATH": str(_TEST_ROOT / "store_lmdb"),
+        "STORE_LMDB__MAP_SIZE_MB": "16",
+        "STORE_LMDB__MAX_VALUE_BYTES": str(4 * 1024 * 1024),
         "STORE_LMDB__MAX_DBS": "256",
     }
 )

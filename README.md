@@ -123,7 +123,7 @@ main.py                       # CLI runner for granian
 ### Services and DI
 
 - Naming: singletons end with `Service`, transients end with `ServiceT`.
-- Register services in `app/lifespan/main.py` with a clear key name; prefer explicit keys.
+- Register services in `app/lifespan/main.py` with either a key or anonymous type-based registration.
 - Use `Inject("key")` for key-based resolution; use type-based injection only when a single service of that type exists.
 - For type-based resolution, `ServiceContainer` uses the factory (`ctor`) return annotation as the service type.
 - Session example: `session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`.
@@ -132,7 +132,7 @@ main.py                       # CLI runner for granian
 
 ### Temporary files
 
-- `TempFileService` (key: `temp_file_service`) manages temporary files under `TMP_DIR`.
+- `TempFileService` (registered anonymously, resolved by `TempFileService` type) manages temporary files under `TMP_DIR`.
 - `TMP_MAX_FILE_SIZE_MB` enforces a per-file size cap for both save and read (`0` means unlimited).
 - `TMP_MAX_TOTAL_SIZE_MB` enforces a global temp-dir size cap for writes (`0` means unlimited).
 - `save(name, content)` stores text or binary; duplicate names become `filename.1.ext`, `filename.2.ext`, etc.
@@ -142,7 +142,7 @@ main.py                       # CLI runner for granian
 
 ### LMDB store
 
-- `StoreService` (key: `store_service`) provides a local LMDB-backed key-value store with TTL.
+- `StoreService` (registered anonymously, resolved by `StoreService` type) provides a local LMDB-backed key-value store with TTL.
 - Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
 - `STORE_LMDB__MAX_DBS` must be `>= 3` to account for data, expiry, and expmeta DBs.
 - Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).

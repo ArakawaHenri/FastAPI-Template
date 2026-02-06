@@ -15,7 +15,7 @@ def _make_store(tmp_path: Path) -> StoreService:
     return StoreService(
         StoreConfig(
             path=str(tmp_path / "store_lmdb"),
-            map_size_mb=64,
+            map_size_mb=16,
             map_size_growth_factor=2,
             map_high_watermark=0.9,
             max_dbs=128,
@@ -26,7 +26,7 @@ def _make_store(tmp_path: Path) -> StoreService:
             map_async=True,
             max_key_bytes=256,
             max_namespace_bytes=256,
-            max_value_bytes=10 * 1024 * 1024,
+            max_value_bytes=4 * 1024 * 1024,
             cleanup_max_deletes=10_000,
             worker_threads=2,
         )
