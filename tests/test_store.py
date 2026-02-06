@@ -9,7 +9,6 @@ from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
-from loguru import logger
 
 from app.services.store.main import StoreConfig, StoreService
 
@@ -111,19 +110,10 @@ async def test_store_expiration_and_cleanup(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_get_missing_namespace_returns_none_warning_without_namespace_creation(tmp_path):
+async def test_get_missing_namespace_returns_none_without_namespace_creation(tmp_path):
     store = _make_store(tmp_path, max_dbs=1)
-    warnings: list[str] = []
-    sink_id = logger.add(
-        lambda msg: warnings.append(msg.record["message"]),
-        level="WARNING",
-    )
-    try:
-        assert await store.get("missing_ns", "missing_key") is None
-    finally:
-        logger.remove(sink_id)
+    assert await store.get("missing_ns", "missing_key") is None
 
-    assert any("Namespace not found" in msg for msg in warnings)
     assert "missing_ns" not in store._list_namespaces()
 
     await store.set("real_ns", "k", "v", retention=10)
@@ -133,21 +123,11 @@ async def test_get_missing_namespace_returns_none_warning_without_namespace_crea
 
 
 @pytest.mark.asyncio
-async def test_get_missing_key_returns_none_and_warning(tmp_path):
+async def test_get_missing_key_returns_none(tmp_path):
     store = _make_store(tmp_path)
     await store.set("default", "exists", "v", retention=10)
 
-    warnings: list[str] = []
-    sink_id = logger.add(
-        lambda msg: warnings.append(msg.record["message"]),
-        level="WARNING",
-    )
-    try:
-        assert await store.get("default", "missing") is None
-    finally:
-        logger.remove(sink_id)
-
-    assert any("Key not found" in msg for msg in warnings)
+    assert await store.get("default", "missing") is None
     await store.shutdown()
 
 

@@ -182,8 +182,10 @@ class StoreService(BaseService):
         )
         self._tighten_file_permissions(self._data_path)
         self._tighten_file_permissions(self._meta_path)
-        self._tighten_file_permissions(self._data_path.with_name(f"{self._data_path.name}-lock"))
-        self._tighten_file_permissions(self._meta_path.with_name(f"{self._meta_path.name}-lock"))
+        self._tighten_file_permissions(
+            self._data_path.with_name(f"{self._data_path.name}-lock"))
+        self._tighten_file_permissions(
+            self._meta_path.with_name(f"{self._meta_path.name}-lock"))
 
         self._db_cache: dict[str, lmdb._Database] = {}
         self._exp_cache: dict[str, lmdb._Database] = {}
@@ -427,21 +429,11 @@ class StoreService(BaseService):
             key_bytes = self._encode_key(key)
             exists = await self._namespace_exists(namespace)
             if not exists:
-                logger.warning(
-                    "[STORE] Namespace not found",
-                    namespace=namespace,
-                    key=key,
-                )
                 return None
             value, event, delete_ts = await self._run_in_executor(
                 self._get, namespace, namespace_escaped, key_bytes
             )
             if value is None and event is None and delete_ts is None:
-                logger.warning(
-                    "[STORE] Key not found",
-                    namespace=namespace,
-                    key=key,
-                )
                 return None
             if delete_ts is not None and not self._callback_guard.get():
                 async with self._write_lock:
