@@ -71,14 +71,14 @@ Use `.env.production_example` and `.env.debug_example` as starting points.
 | `DEBUG_MODE` | bool | `false` | Production should be `false` |
 | `RELOAD` | bool | `false` | Development only |
 | `CORS_ORIGINS` | JSON list | `["https://example.com"]` | Empty list disables CORS |
-| `LOG_DIR` | string | `./log` | Created automatically |
+| `LOG_DIR` | string | `./logs` | Created automatically |
 | `TMP_DIR` | string | `./tmp` | Temp file base directory |
 | `TMP_RETENTION_DAYS` | int | `3` | Temp file retention days |
 | `TMP_MAX_FILE_SIZE_MB` | int | `1024` | Max size per temp file (`0` means unlimited) |
 | `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | Max total size of temp dir (`0` means unlimited) |
 | `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | Async SQLAlchemy URL |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB store path |
-| `STORE_LMDB__MAX_DBS` | int | `256` | Must be `>= 3` |
+| `STORE_LMDB__MAX_DBS` | int | `256` | Must be `>= 0` (`0` disables user-namespace quota) |
 | `SEMAPHORES__db` | int | `5` | Example nested config |
 | `SEMAPHORES__example` | int | `10` | Used by `/api/v1/example/` demo route |
 
@@ -144,7 +144,8 @@ main.py                       # CLI runner for granian
 
 - `StoreService` (registered anonymously, resolved by `StoreService` type) provides a local LMDB-backed key-value store with TTL.
 - Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
-- `STORE_LMDB__MAX_DBS` must be `>= 3` to account for data, expiry, and expmeta DBs.
+- `STORE_LMDB__MAX_DBS` controls user-namespace quota and must be `>= 0`; `0` disables the quota.
+- Namespaces marked as internal are excluded from user-namespace quota counting.
 - Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).
 
 ### Lifespan

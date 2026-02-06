@@ -20,7 +20,7 @@
 from app.middleware.exception import NotFoundException
 
 # 基本用法
-raise NotFoundException("User", user_id=123)
+raise NotFoundException("User", 123)
 # 响应: {"error": {"code": "RESOURCE_NOT_FOUND", "message": "User not found: 123", ...}}
 
 # 不带标识符
@@ -380,7 +380,7 @@ def test_api_error_response(client: TestClient):
 
 ## 相关文件
 
-- [exception.py](file:///Users/henri/Code/fastapi_template/app/middleware/exception.py) - 异常类和处理器实现
-- [main.py](file:///Users/henri/Code/fastapi_template/app/main.py) - 异常处理器注册
-- [exception_examples.py](file:///Users/henri/Code/fastapi_template/app/api/v1/examples/exception_examples.py) - 使用示例
-- [test_exceptions.py](file:///Users/henri/Code/fastapi_template/tests/test_exceptions.py) - 单元测试
+- `app/middleware/exception.py` - 异常类和处理器实现
+- `app/main.py` - 异常处理器注册
+- `app/api/v1/example/example.py` - 示例路由
+- `tests/api/v1/test_demo.py` - API 示例测试（包含基础错误场景）

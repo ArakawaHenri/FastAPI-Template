@@ -71,14 +71,14 @@ uv run python main.py --host 0.0.0.0 --port 8000
 | `DEBUG_MODE` | bool | `false` | 生产必须为 `false` |
 | `RELOAD` | bool | `false` | 仅开发环境 |
 | `CORS_ORIGINS` | JSON list | `["https://example.com"]` | 空数组禁用 CORS |
-| `LOG_DIR` | string | `./log` | 自动创建 |
+| `LOG_DIR` | string | `./logs` | 自动创建 |
 | `TMP_DIR` | string | `./tmp` | 临时文件目录 |
 | `TMP_RETENTION_DAYS` | int | `3` | 临时文件保留天数 |
 | `TMP_MAX_FILE_SIZE_MB` | int | `1024` | 单个临时文件大小上限（`0` 表示不限） |
 | `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | 临时目录总大小上限（`0` 表示不限） |
 | `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | SQLAlchemy 异步连接串 |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB 存储路径 |
-| `STORE_LMDB__MAX_DBS` | int | `256` | 必须 `>= 3` |
+| `STORE_LMDB__MAX_DBS` | int | `256` | 必须 `>= 0`（`0` 表示关闭用户 namespace 配额） |
 | `SEMAPHORES__db` | int | `5` | 嵌套配置示例 |
 | `SEMAPHORES__example` | int | `10` | `/api/v1/example/` 示例路由使用 |
 
@@ -144,7 +144,8 @@ main.py                       # granian 启动脚本
 
 - `StoreService`（匿名注册，按 `StoreService` 类型解析）提供本地 LMDB KV + TTL。
 - 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
-- `STORE_LMDB__MAX_DBS` 必须 `>= 3`。
+- `STORE_LMDB__MAX_DBS` 用于控制用户 namespace 配额，必须 `>= 0`；`0` 表示关闭配额限制。
+- 被标记为 internal 的 namespace 不计入用户 namespace 配额。
 - 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。
 
 ### Lifespan
