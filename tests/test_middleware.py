@@ -1,6 +1,18 @@
 """Tests for middleware functionality"""
 from __future__ import annotations
 
+import pytest
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.testclient import TestClient
+from starlette.requests import Request
+from starlette.responses import Response
+
+from app.core.logger import request_id_ctx
+from app.core.settings import settings
+from app.middleware.exception import NotFoundException, validation_exception_handler
+from app.middleware.logging import RequestLoggingMiddleware
+
 
 class TestRequestLoggingMiddleware:
     """Tests for RequestLoggingMiddleware"""
@@ -38,6 +50,48 @@ class TestRequestLoggingMiddleware:
         assert id1 is not None
         assert id2 is not None
         assert id1 != id2
+
+    def test_request_id_replaced_when_header_contains_invalid_chars(self, client):
+        response = client.get("/api/", headers={"X-Request-ID": "bad id\r\nx"})
+        assert response.status_code == 200
+        request_id = response.headers["X-Request-ID"]
+        assert len(request_id) == 36
+        assert request_id.count("-") == 4
+
+    def test_request_id_replaced_when_header_too_long(self, client):
+        response = client.get("/api/", headers={"X-Request-ID": "a" * 256})
+        assert response.status_code == 200
+        request_id = response.headers["X-Request-ID"]
+        assert len(request_id) == 36
+        assert request_id.count("-") == 4
+
+    @pytest.mark.asyncio
+    async def test_request_id_context_is_reset_after_dispatch(self):
+        middleware = RequestLoggingMiddleware(app=lambda scope, receive, send: None)
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/api/",
+            "query_string": b"",
+            "headers": [(b"x-request-id", b"ctx-reset-id")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+        }
+        request = Request(scope)
+
+        seed = request_id_ctx.set("outer-scope")
+        try:
+            async def call_next(_request):
+                return Response(content="ok")
+
+            response = await middleware.dispatch(request, call_next)
+
+            assert response.status_code == 200
+            assert request_id_ctx.get() == "outer-scope"
+        finally:
+            request_id_ctx.reset(seed)
 
 
 class TestTransientServiceFinalizerMiddleware:
@@ -83,3 +137,32 @@ class TestExceptionMiddleware:
         assert "error" in data
         assert "code" in data["error"]
         assert data["error"]["code"] == "NOT_FOUND"
+
+    def test_not_found_exception_keeps_zero_identifier(self):
+        exc = NotFoundException("User", 0)
+        assert exc.message == "User not found: 0"
+        assert exc.details["identifier"] == "0"
+
+    def test_validation_error_debug_body_bytes_are_serializable(self, monkeypatch):
+        monkeypatch.setattr(settings, "debug_mode", True)
+
+        app = FastAPI()
+        app.add_exception_handler(
+            RequestValidationError, validation_exception_handler
+        )
+
+        @app.post("/payload")
+        async def create_payload(payload: dict):
+            return payload
+
+        with TestClient(app, raise_server_exceptions=False) as local_client:
+            response = local_client.post(
+                "/payload",
+                content=b'{"bad_json":',
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        data = response.json()
+        assert data["error"]["code"] == "VALIDATION_ERROR"
+        assert isinstance(data["error"]["details"]["body"], str)

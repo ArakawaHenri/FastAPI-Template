@@ -31,6 +31,7 @@ async def run_in_executor(
 def try_acquire_file_lock(path: Path) -> Optional[TextIO]:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+")
+    tighten_file_permissions(path)
     try:
         portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
     except LockException:

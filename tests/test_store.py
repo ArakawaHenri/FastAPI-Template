@@ -166,6 +166,59 @@ async def test_store_expiry_callback(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_store_expiry_callback_retries_then_succeeds(tmp_path):
+    store = _make_store(tmp_path)
+    attempts = 0
+    callback_done = asyncio.Event()
+
+    async def flaky(event):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient callback failure")
+        assert event.key == "k1"
+        callback_done.set()
+
+    await store.register_builtin_callback("flaky")
+    await store.register_expiry_callback("flaky", flaky)
+    await store.set("default", "k1", "v1", retention=1, on_expire="flaky")
+
+    await store.cleanup_expired(now=time.time() + 120)
+    await asyncio.wait_for(callback_done.wait(), timeout=5)
+    await asyncio.wait_for(store.wait_for_callbacks(), timeout=5)
+
+    assert attempts == 2
+    assert store._count_callback_jobs() == 0
+    assert store._count_dead_letter_callback_jobs() == 0
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_store_expiry_callback_moves_to_dead_letter_after_retry_limit(tmp_path):
+    store = _make_store(tmp_path)
+    attempts = 0
+
+    async def always_fail(_event):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("permanent callback failure")
+
+    await store.register_builtin_callback("always_fail")
+    await store.register_expiry_callback("always_fail", always_fail)
+    await store.set("default", "k1", "v1", retention=1, on_expire="always_fail")
+
+    await store.cleanup_expired(now=time.time() + 120)
+    await asyncio.wait_for(store.wait_for_callbacks(), timeout=5)
+
+    assert attempts == 2
+    assert store._count_callback_jobs() == 0
+    assert store._count_dead_letter_callback_jobs() == 1
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_store_expiry_callback_survives_restart(tmp_path):
     db_path = tmp_path / "store_lmdb"
     callback_lock = StoreService._try_acquire_file_lock(
@@ -211,6 +264,7 @@ async def test_store_expiry_callback_survives_restart(tmp_path):
     assert expire_ts > 0
 
     await store2.shutdown()
+
 
 @pytest.mark.asyncio
 async def test_store_key_namespace_escape(tmp_path):
@@ -346,6 +400,31 @@ async def test_internal_namespace_migration_after_registration(tmp_path):
     assert await store.get("tmp_files", "k1") == "v1"
     assert await store.get("user_ns", "k") == "v"
     assert await store.get("another_user_ns", "k") == "v"
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_namespace_registration_failure_does_not_pollute_memory_state(
+    tmp_path, monkeypatch
+):
+    store = _make_store(tmp_path)
+
+    original_register = store._register_namespace_in_meta
+
+    def fail_register(_namespace: str) -> None:
+        raise RuntimeError("meta registration failed")
+
+    monkeypatch.setattr(store, "_register_namespace_in_meta", fail_register)
+
+    with pytest.raises(RuntimeError, match="meta registration failed"):
+        await store.set("ns_fail", "k", "v", retention=10)
+
+    assert "ns_fail" not in store._namespaces
+
+    monkeypatch.setattr(store, "_register_namespace_in_meta", original_register)
+    await store.set("ns_fail", "k", "v", retention=10)
+    assert await store.get("ns_fail", "k") == "v"
 
     await store.shutdown()
 

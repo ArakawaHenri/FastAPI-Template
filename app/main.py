@@ -39,9 +39,10 @@ def create_application() -> FastAPI:
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(Exception, global_exception_handler)
 
-    # Middleware order: Logging -> Transient cleanup
-    app.add_middleware(RequestLoggingMiddleware)
+    # Starlette middleware executes in reverse registration order.
+    # Register transient cleanup first so request logging wraps the full chain.
     app.add_middleware(TransientServiceFinalizerMiddleware)
+    app.add_middleware(RequestLoggingMiddleware)
     app.include_router(router)
     return app
 

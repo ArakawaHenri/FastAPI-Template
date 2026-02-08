@@ -1027,14 +1027,14 @@ def Inject(
 
         if key_specified:
             return await services.aget_by_key(lookup_value, *final_args, **final_kwargs)
-        else:
-            return await services.aget_by_type(lookup_value, *final_args, **final_kwargs)
+        return await services.aget_by_type(lookup_value, *final_args, **final_kwargs)
 
     # Improve callable name for better error stacks & docs
-    if key_specified:
-        name_suffix = str(lookup_value)
-    else:
-        name_suffix = getattr(lookup_value, "__name__", repr(lookup_value))
+    name_suffix = (
+        str(lookup_value)
+        if key_specified
+        else getattr(lookup_value, "__name__", repr(lookup_value))
+    )
 
     _dependency_callable.__name__ = (
         f"inject_{'key' if key_specified else 'type'}_{name_suffix}"

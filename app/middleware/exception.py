@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -34,13 +35,16 @@ class NotFoundException(AppException):
     """Raised when a resource is not found"""
     def __init__(self, resource: str, identifier: Any = None):
         message = f"{resource} not found"
-        if identifier:
+        if identifier is not None:
             message += f": {identifier}"
         super().__init__(
             message=message,
             status_code=status.HTTP_404_NOT_FOUND,
             error_code="RESOURCE_NOT_FOUND",
-            details={"resource": resource, "identifier": str(identifier) if identifier else None}
+            details={
+                "resource": resource,
+                "identifier": str(identifier) if identifier is not None else None,
+            }
         )
 
 
@@ -101,6 +105,24 @@ class RateLimitException(AppException):
 # Exception Handlers
 # =============================================================================
 
+def _serialize_debug_body(body: Any) -> Any:
+    """
+    Convert validation body payload into JSON-safe content for debug responses.
+
+    RequestValidationError.body may contain raw bytes (including invalid UTF-8),
+    which can break JSON serialization if returned directly.
+    """
+    custom_encoder = {
+        bytes: lambda v: v.decode("utf-8", errors="replace"),
+        bytearray: lambda v: bytes(v).decode("utf-8", errors="replace"),
+        memoryview: lambda v: v.tobytes().decode("utf-8", errors="replace"),
+    }
+    try:
+        return jsonable_encoder(body, custom_encoder=custom_encoder)
+    except Exception:
+        return repr(body)
+
+
 def create_error_response(
     status_code: int,
     message: str,
@@ -145,7 +167,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     # Include request body only in debug mode
     if settings.debug_mode:
-        details["body"] = exc.body
+        details["body"] = _serialize_debug_body(exc.body)
 
     return create_error_response(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

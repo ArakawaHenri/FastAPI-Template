@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import time
@@ -275,6 +276,28 @@ async def test_overwrite_symlink_replaces_with_regular_file(tmp_path: Path):
     assert not path.is_symlink()
     assert await service.read("swap.txt") == "inside"
     assert target.read_text(encoding="utf-8") == "outside"
+
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_save_overwrite_is_not_deleted_by_stale_expiry_callback(tmp_path: Path):
+    service, store = await _make_service(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    try:
+        await service.save_overwrite("same.txt", "old")
+        await store.cleanup_expired(now=time.time() + 2 * 24 * 60 * 60)
+        await service.save_overwrite("same.txt", "new")
+    finally:
+        StoreService._release_file_lock(callback_lock)
+
+    await asyncio.wait_for(store.wait_for_callbacks(), timeout=5)
+    assert await service.read("same.txt") == "new"
 
     await service.shutdown()
     await store.shutdown()

@@ -35,8 +35,12 @@ _CALLBACK_ENTRY_DB_PREFIX = b"__cbentry__:"
 _CALLBACK_REGISTRY_PREFIX = b"cb:"
 _CALLBACK_JOB_DB_NAME = b"__cb_jobs__"
 _CALLBACK_SCHEDULE_DB_NAME = b"__cb_sched__"
+_CALLBACK_DEAD_LETTER_DB_NAME = b"__cb_dlq__"
 _CALLBACK_POLL_INTERVAL_SECONDS = 1.0
 _CALLBACK_WAIT_POLL_SECONDS = 0.05
+_CALLBACK_MAX_RETRIES = 1
+_CALLBACK_RETRY_BASE_SECONDS = 1
+_CALLBACK_RETRY_MAX_SECONDS = 30
 _INTERNAL_OPEN_MAX_DBS = 65535
 
 _MapFullError = getattr(lmdb, "MapFullError", None)
@@ -80,6 +84,7 @@ class _CallbackJob:
     job_id: bytes
     due_ts: int
     event: ExpiryCallbackEvent
+    attempts: int
 
 
 class StoreService(BaseService):
@@ -197,6 +202,8 @@ class StoreService(BaseService):
             _CALLBACK_JOB_DB_NAME, create=True)
         self._callback_schedule_db: lmdb._Database = self._open_meta_db(
             _CALLBACK_SCHEDULE_DB_NAME, create=True, dupsort=True)
+        self._callback_dead_letter_db: lmdb._Database = self._open_meta_db(
+            _CALLBACK_DEAD_LETTER_DB_NAME, create=True)
         self._meta_db: lmdb._Database = self._open_meta_db(
             _META_DB_NAME, create=True)
         self._db_cache_lock = threading.Lock()
@@ -494,19 +501,20 @@ class StoreService(BaseService):
             raise
 
     async def _register_namespace(self, namespace: str, namespace_escaped: str) -> None:
+        # Keep namespace_lock across the registration sequence so callers cannot
+        # observe "registered in memory" before meta persistence succeeds.
         async with self._namespace_lock:
             if namespace in self._namespaces:
                 return
             self._ensure_data_db_capacity(namespace)
+            self._get_db(namespace_escaped)
+            if self._callback_guard.get():
+                raise RuntimeError(
+                    "Expiry callbacks cannot register new namespaces during callback execution"
+                )
+            async with self._write_lock:
+                await self._run_in_executor(self._register_namespace_in_meta, namespace)
             self._namespaces.add(namespace)
-
-        self._get_db(namespace_escaped)
-        if self._callback_guard.get():
-            raise RuntimeError(
-                "Expiry callbacks cannot register new namespaces during callback execution"
-            )
-        async with self._write_lock:
-            await self._run_in_executor(self._register_namespace_in_meta, namespace)
 
     def _get_db(self, namespace: str) -> lmdb._Database:
         db = self._db_cache.get(namespace)
@@ -1051,14 +1059,13 @@ class StoreService(BaseService):
 
     def _list_namespaces(self) -> list[str]:
         namespaces: list[str] = []
-        with self._meta_env.begin(write=False) as txn:
-            with txn.cursor(db=self._meta_db) as cursor:
-                if cursor.set_range(_META_NS_PREFIX):
-                    for key, _ in cursor:
-                        if not key.startswith(_META_NS_PREFIX):
-                            break
-                        namespaces.append(
-                            key[len(_META_NS_PREFIX):].decode("utf-8"))
+        with self._meta_env.begin(write=False) as txn, txn.cursor(db=self._meta_db) as cursor:
+            if cursor.set_range(_META_NS_PREFIX):
+                for key, _ in cursor:
+                    if not key.startswith(_META_NS_PREFIX):
+                        break
+                    namespaces.append(
+                        key[len(_META_NS_PREFIX):].decode("utf-8"))
         return namespaces
 
     def _open_env_db(self, env, name: bytes, db_type: str, **kwargs) -> lmdb._Database:
@@ -1249,15 +1256,23 @@ class StoreService(BaseService):
                         continue
                     continue
 
+                should_complete = False
                 self._callback_active = True
                 try:
-                    await self._run_callback(job.event)
+                    should_complete = await self._run_callback(job.event)
                 finally:
                     self._callback_active = False
+
+                if should_complete:
                     await self._run_in_executor(
                         self._complete_callback_job,
                         job.due_ts,
                         job.job_id,
+                    )
+                else:
+                    await self._run_in_executor(
+                        self._retry_callback_job,
+                        job,
                     )
         finally:
             self._release_file_lock(self._callback_lock_handle)
@@ -1275,12 +1290,8 @@ class StoreService(BaseService):
         self._callback_wakeup.set()
         await self._callback_task
         self._callback_task = None
-        await self._run_in_executor(
-            self._release_file_lock, self._callback_lock_handle
-        )
-        self._callback_lock_handle = None
 
-    async def _run_callback(self, event: ExpiryCallbackEvent) -> None:
+    async def _run_callback(self, event: ExpiryCallbackEvent) -> bool:
         callback = self._callback_registry.get(event.callback)
         if callback is None:
             logger.error(
@@ -1289,11 +1300,12 @@ class StoreService(BaseService):
                 namespace=event.namespace,
                 key=event.key,
             )
-            return
+            return True
         token = self._callback_guard.set(True)
         try:
             async with self._write_lock:
                 await callback(event)
+            return True
         except Exception:
             logger.exception(
                 "[STORE] Expiry callback failed",
@@ -1301,8 +1313,22 @@ class StoreService(BaseService):
                 namespace=event.namespace,
                 key=event.key,
             )
+            return False
         finally:
             self._callback_guard.reset(token)
+
+    @staticmethod
+    def _encode_callback_job_payload(event: ExpiryCallbackEvent, attempts: int) -> bytes:
+        return cbor2.dumps(
+            {
+                "namespace": event.namespace,
+                "key": event.key,
+                "value": event.value,
+                "expire_ts": event.expire_ts,
+                "callback": event.callback,
+                "attempts": attempts,
+            }
+        )
 
     def _persist_callback_jobs(self, events: list[ExpiryCallbackEvent]) -> None:
         now_ts = int(time.time())
@@ -1311,15 +1337,7 @@ class StoreService(BaseService):
         serialized_events: list[tuple[bytes, bytes]] = []
         for event in events:
             job_id = uuid4().hex.encode("ascii")
-            payload = cbor2.dumps(
-                {
-                    "namespace": event.namespace,
-                    "key": event.key,
-                    "value": event.value,
-                    "expire_ts": event.expire_ts,
-                    "callback": event.callback,
-                }
-            )
+            payload = self._encode_callback_job_payload(event, attempts=0)
             serialized_events.append((job_id, payload))
             estimated += len(job_id) + len(payload) + len(due_key) + 128
 
@@ -1331,42 +1349,47 @@ class StoreService(BaseService):
         self._write_meta_txn_with_resize(_write, estimated)
 
     def _peek_due_callback_job(self, now_ts: int) -> Optional[_CallbackJob]:
-        with self._meta_env.begin(write=True) as txn:
-            with txn.cursor(db=self._callback_schedule_db) as cursor:
-                if not cursor.first():
+        with self._meta_env.begin(write=True) as txn, txn.cursor(db=self._callback_schedule_db) as cursor:
+            if not cursor.first():
+                return None
+
+            while True:
+                due_key = cursor.key()
+                if due_key is None:
+                    return None
+                if len(due_key) < _EXPIRY_STRUCT.size:
+                    cursor.delete()
+                    if not cursor.next():
+                        return None
+                    continue
+
+                due_ts = _EXPIRY_STRUCT.unpack_from(due_key, 0)[0]
+                if due_ts > now_ts:
                     return None
 
-                while True:
-                    due_key = cursor.key()
-                    if due_key is None:
+                job_id = bytes(cursor.value())
+                payload = txn.get(job_id, db=self._callback_job_db)
+                if payload is None:
+                    cursor.delete()
+                    if not cursor.next():
                         return None
-                    if len(due_key) < _EXPIRY_STRUCT.size:
-                        cursor.delete()
-                        if not cursor.next():
-                            return None
-                        continue
+                    continue
 
-                    due_ts = _EXPIRY_STRUCT.unpack_from(due_key, 0)[0]
-                    if due_ts > now_ts:
+                decoded = self._decode_callback_job(payload)
+                if decoded is None:
+                    cursor.delete()
+                    txn.delete(job_id, db=self._callback_job_db)
+                    if not cursor.next():
                         return None
+                    continue
 
-                    job_id = bytes(cursor.value())
-                    payload = txn.get(job_id, db=self._callback_job_db)
-                    if payload is None:
-                        cursor.delete()
-                        if not cursor.next():
-                            return None
-                        continue
-
-                    event = self._decode_callback_job(payload)
-                    if event is None:
-                        cursor.delete()
-                        txn.delete(job_id, db=self._callback_job_db)
-                        if not cursor.next():
-                            return None
-                        continue
-
-                    return _CallbackJob(job_id=job_id, due_ts=due_ts, event=event)
+                event, attempts = decoded
+                return _CallbackJob(
+                    job_id=job_id,
+                    due_ts=due_ts,
+                    event=event,
+                    attempts=attempts,
+                )
 
     def _complete_callback_job(self, due_ts: int, job_id: bytes) -> None:
         due_key = _EXPIRY_STRUCT.pack(due_ts)
@@ -1377,24 +1400,82 @@ class StoreService(BaseService):
 
         self._write_meta_txn_with_resize(_write, 0)
 
+    def _retry_callback_job(self, job: _CallbackJob) -> None:
+        next_attempt = job.attempts + 1
+        if next_attempt > _CALLBACK_MAX_RETRIES:
+            self._dead_letter_callback_job(job)
+            return
+
+        delay_seconds = min(
+            _CALLBACK_RETRY_BASE_SECONDS * (2 ** job.attempts),
+            _CALLBACK_RETRY_MAX_SECONDS,
+        )
+        next_due_ts = int(time.time()) + delay_seconds
+        old_due_key = _EXPIRY_STRUCT.pack(job.due_ts)
+        next_due_key = _EXPIRY_STRUCT.pack(next_due_ts)
+        payload = self._encode_callback_job_payload(job.event, attempts=next_attempt)
+        estimated = len(job.job_id) + len(payload) + len(next_due_key) + 128
+
+        def _write(txn) -> None:
+            txn.delete(old_due_key, job.job_id, db=self._callback_schedule_db)
+            txn.put(job.job_id, payload, db=self._callback_job_db)
+            txn.put(next_due_key, job.job_id, db=self._callback_schedule_db)
+
+        self._write_meta_txn_with_resize(_write, estimated)
+
+    def _dead_letter_callback_job(self, job: _CallbackJob) -> None:
+        now_ts = int(time.time())
+        old_due_key = _EXPIRY_STRUCT.pack(job.due_ts)
+        dlq_key = f"{now_ts}:{uuid4().hex}".encode("ascii")
+        payload = cbor2.dumps(
+            {
+                "job_id": job.job_id.decode("ascii", errors="replace"),
+                "namespace": job.event.namespace,
+                "key": job.event.key,
+                "value": job.event.value,
+                "expire_ts": job.event.expire_ts,
+                "callback": job.event.callback,
+                "attempts": job.attempts + 1,
+                "failed_at": now_ts,
+                "reason": "callback_failed_max_retries",
+            }
+        )
+        estimated = len(dlq_key) + len(payload) + len(job.job_id) + len(old_due_key) + 128
+
+        def _write(txn) -> None:
+            txn.delete(old_due_key, job.job_id, db=self._callback_schedule_db)
+            txn.delete(job.job_id, db=self._callback_job_db)
+            txn.put(dlq_key, payload, db=self._callback_dead_letter_db)
+
+        self._write_meta_txn_with_resize(_write, estimated)
+
     def _count_callback_jobs(self) -> int:
         with self._meta_env.begin(write=False) as txn:
             return txn.stat(db=self._callback_job_db)["entries"]
 
-    def _decode_callback_job(self, payload: bytes) -> Optional[ExpiryCallbackEvent]:
+    def _count_dead_letter_callback_jobs(self) -> int:
+        with self._meta_env.begin(write=False) as txn:
+            return txn.stat(db=self._callback_dead_letter_db)["entries"]
+
+    def _decode_callback_job(
+        self, payload: bytes
+    ) -> Optional[tuple[ExpiryCallbackEvent, int]]:
         try:
             data = cbor2.loads(payload)
         except Exception:
             logger.exception("[STORE] Corrupt callback job payload; dropping")
             return None
         try:
-            return ExpiryCallbackEvent(
+            attempts_raw = int(data.get("attempts", 0))
+            attempts = attempts_raw if attempts_raw >= 0 else 0
+            event = ExpiryCallbackEvent(
                 namespace=str(data["namespace"]),
                 key=str(data["key"]),
                 value=data.get("value"),
                 expire_ts=int(data["expire_ts"]),
                 callback=str(data["callback"]),
             )
+            return event, attempts
         except Exception:
             logger.exception("[STORE] Invalid callback job fields; dropping")
             return None

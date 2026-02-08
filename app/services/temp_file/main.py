@@ -7,6 +7,7 @@ import math
 import os
 import stat
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -116,6 +117,31 @@ class TempFileService(BaseService):
         return f"{cls.CALLBACK_NAME_PREFIX}:{quote(namespace, safe='')}"
 
     @staticmethod
+    def _new_revision() -> str:
+        return uuid.uuid4().hex
+
+    @staticmethod
+    def _encode_metadata(is_text: bool, revision: str) -> dict[str, object]:
+        return {
+            "is_text": is_text,
+            "revision": revision,
+        }
+
+    @staticmethod
+    def _decode_metadata(value: object) -> tuple[bool, str] | None:
+        if not isinstance(value, dict):
+            return None
+        is_text = value.get("is_text")
+        if not isinstance(is_text, bool):
+            return None
+        revision = value.get("revision")
+        if not isinstance(revision, str):
+            return None
+        if revision.strip() == "":
+            return None
+        return is_text, revision
+
+    @staticmethod
     async def _resolve_store_provider(store_provider) -> StoreService:
         if store_provider is None:
             raise ValueError(
@@ -186,6 +212,7 @@ class TempFileService(BaseService):
         self._assert_open()
         base_name = self._sanitize_filename(filename)
         is_text, data = self._normalize_content(content)
+        revision = self._new_revision()
         self._assert_size_allowed(len(data), filename=base_name)
         async with self._write_guard:
             await self._run_in_executor(
@@ -199,7 +226,12 @@ class TempFileService(BaseService):
                 self._write_unique, base_name, data, now
             )
         try:
-            await self._set_metadata(saved_name, is_text, self._retention_minutes)
+            await self._set_metadata(
+                saved_name,
+                is_text,
+                self._retention_minutes,
+                revision=revision,
+            )
         except Exception:
             await self._run_in_executor(self._delete_file, saved_name)
             logger.exception(
@@ -216,6 +248,7 @@ class TempFileService(BaseService):
         self._assert_open()
         base_name = self._sanitize_filename(filename)
         is_text, data = self._normalize_content(content)
+        revision = self._new_revision()
         self._assert_size_allowed(len(data), filename=base_name)
         async with self._write_guard:
             await self._run_in_executor(
@@ -227,7 +260,12 @@ class TempFileService(BaseService):
             now = time.time()
             await self._run_in_executor(self._write_overwrite, base_name, data, now)
         try:
-            await self._set_metadata(base_name, is_text, self._retention_minutes)
+            await self._set_metadata(
+                base_name,
+                is_text,
+                self._retention_minutes,
+                revision=revision,
+            )
         except Exception:
             await self._run_in_executor(self._delete_file, base_name)
             logger.exception(
@@ -267,12 +305,18 @@ class TempFileService(BaseService):
             raise
         now = time.time()
 
-        is_text = await self._resolve_is_text(safe_name, path, data, now)
-        if is_text is None:
+        metadata = await self._resolve_metadata(safe_name, path, data, now)
+        if metadata is None:
             raise FileNotFoundError(safe_name)
+        is_text, revision = metadata
 
         await self._run_in_executor(self._touch_file, path, now)
-        await self._set_metadata(safe_name, is_text, self._retention_minutes)
+        await self._set_metadata(
+            safe_name,
+            is_text,
+            self._retention_minutes,
+            revision=revision,
+        )
 
         if is_text:
             return data.decode("utf-8")
@@ -286,30 +330,35 @@ class TempFileService(BaseService):
         await self._store.cleanup_expired(now)
         await self._reconcile_files(now, adopt_fresh=False)
 
-    async def _set_metadata(self, name: str, is_text: bool, retention_minutes: int) -> None:
+    async def _set_metadata(
+        self,
+        name: str,
+        is_text: bool,
+        retention_minutes: int,
+        revision: str,
+    ) -> None:
+        payload = self._encode_metadata(is_text, revision)
         async with self._namespace_lock:
             await self._store.set(
                 self._namespace,
                 name,
-                is_text,
+                payload,
                 retention=retention_minutes,
                 on_expire=self._callback_name,
             )
 
-    async def _get_metadata(self, name: str) -> Optional[bool]:
+    async def _get_metadata(self, name: str) -> tuple[bool, str] | None:
         async with self._namespace_lock:
             value = await self._store.get(self._namespace, name)
-        if isinstance(value, bool):
-            return value
-        return None
+        return self._decode_metadata(value)
 
-    async def _resolve_is_text(
+    async def _resolve_metadata(
         self,
         name: str,
         path: Path,
         data: bytes,
         now: float,
-    ) -> Optional[bool]:
+    ) -> tuple[bool, str] | None:
         meta = await self._get_metadata(name)
         if meta is not None:
             return meta
@@ -324,7 +373,7 @@ class TempFileService(BaseService):
             await self._run_in_executor(self._delete_file, name)
             return None
 
-        return self._is_utf8(data)
+        return self._is_utf8(data), self._new_revision()
 
     async def _adopt_existing_files(self) -> None:
         now = time.time()
@@ -341,8 +390,8 @@ class TempFileService(BaseService):
 
         async with self._namespace_lock:
             for name, mtime in entries:
-                meta = await self._store.get(self._namespace, name)
-                if isinstance(meta, bool):
+                value = await self._store.get(self._namespace, name)
+                if self._decode_metadata(value) is not None:
                     continue
                 if mtime < cutoff:
                     delete_names.append(name)
@@ -363,7 +412,12 @@ class TempFileService(BaseService):
             remaining = max(1, math.ceil(
                 (self._retention_seconds - (now - mtime)) / 60))
             try:
-                await self._set_metadata(name, is_text, remaining)
+                await self._set_metadata(
+                    name,
+                    is_text,
+                    remaining,
+                    revision=self._new_revision(),
+                )
             except Exception:
                 logger.exception(
                     "[TMP] Failed to adopt temp file metadata", name=name)
@@ -375,6 +429,41 @@ class TempFileService(BaseService):
                 "[TMP] Skipping expiry callback after shutdown", key=event.key)
             return
         try:
+            path = self._base_dir / event.key
+            try:
+                mtime = await self._run_in_executor(self._get_mtime, path)
+            except FileNotFoundError:
+                return
+            except ValueError:
+                logger.warning(
+                    "[TMP] Expiry callback skipped non-regular file", key=event.key
+                )
+                return
+
+            if event.expire_ts > 0 and mtime > float(event.expire_ts):
+                logger.debug(
+                    "[TMP] Skipping stale expiry callback for newer temp file",
+                    key=event.key,
+                    expire_ts=event.expire_ts,
+                    mtime=mtime,
+                )
+                return
+
+            event_metadata = self._decode_metadata(event.value)
+            expected_revision = event_metadata[1] if event_metadata is not None else None
+            if expected_revision is not None:
+                current_meta = await self._get_metadata(event.key)
+                if current_meta is not None:
+                    _, current_revision = current_meta
+                    if current_revision != expected_revision:
+                        logger.debug(
+                            "[TMP] Skipping stale expiry callback due to revision mismatch",
+                            key=event.key,
+                            expected_revision=expected_revision,
+                            current_revision=current_revision,
+                        )
+                        return
+
             await self._run_in_executor(self._delete_file, event.key)
         except Exception:
             logger.exception("[TMP] Expiry callback failed", key=event.key)
@@ -406,10 +495,11 @@ class TempFileService(BaseService):
             if attempt == 0:
                 candidate = base_name
             else:
-                if suffix:
-                    candidate = f"{stem}.{attempt}{suffix}"
-                else:
-                    candidate = f"{base_name}.{attempt}"
+                candidate = (
+                    f"{stem}.{attempt}{suffix}"
+                    if suffix
+                    else f"{base_name}.{attempt}"
+                )
 
             path = self._base_dir / candidate
             try:
