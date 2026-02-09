@@ -21,11 +21,11 @@ from app.middleware.exception import NotFoundException
 
 # 基本用法
 raise NotFoundException("User", 123)
-# 响应: {"error": {"code": "RESOURCE_NOT_FOUND", "message": "User not found: 123", ...}}
+# 响应: {"error": {"code": "NOT_FOUND", "message": "User not found: 123", ...}}
 
 # 不带标识符
 raise NotFoundException("Settings")
-# 响应: {"error": {"code": "RESOURCE_NOT_FOUND", "message": "Settings not found", ...}}
+# 响应: {"error": {"code": "NOT_FOUND", "message": "Settings not found", ...}}
 ```
 
 ### 2. UnauthorizedException (401)
@@ -195,7 +195,7 @@ async def delete_post(post_id: int, current_user: User = Depends(get_current_use
 ```json
 {
   "error": {
-    "code": "RESOURCE_NOT_FOUND",
+    "code": "NOT_FOUND",
     "message": "User not found: 123",
     "details": {
       "resource": "User",
@@ -372,7 +372,7 @@ def test_api_error_response(client: TestClient):
     assert response.status_code == 404
     
     data = response.json()
-    assert data["error"]["code"] == "RESOURCE_NOT_FOUND"
+    assert data["error"]["code"] == "NOT_FOUND"
     assert "User" in data["error"]["message"]
 ```
 

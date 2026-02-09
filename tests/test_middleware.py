@@ -1,13 +1,21 @@
 """Tests for middleware functionality"""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import pytest
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.core.dependencies import (
+    Inject,
+    ServiceContainer,
+    ServiceLifetime,
+    TransientServiceFinalizerMiddleware,
+)
 from app.core.logger import request_id_ctx
 from app.core.settings import settings
 from app.middleware.exception import NotFoundException, validation_exception_handler
@@ -109,13 +117,51 @@ class TestTransientServiceFinalizerMiddleware:
         assert response2.status_code == 200
 
     def test_generator_service_cleanup(self, client):
-        """Test that generator-based transient services are cleaned up"""
-        # ExampleGeneratorServiceT uses async generator pattern
+        """Test that contextmanager-style transient services are cleaned up"""
+        # ExampleGeneratorServiceT uses async contextmanager-style pattern
         response = client.get("/api/v1/example/")
         assert response.status_code == 200
 
         data = response.json()
         assert "index_of_item_enumerated_from_example_generator" in data
+
+    def test_finalizer_runs_after_background_tasks(self):
+        call_order: list[str] = []
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            services = ServiceContainer()
+
+            async def factory():
+                try:
+                    yield {"ok": True}
+                finally:
+                    call_order.append("finalizer")
+
+            await services.register("transient", ServiceLifetime.TRANSIENT, factory, None)
+            app.state.services = services
+            try:
+                yield
+            finally:
+                await services.destruct_all_singletons()
+
+        app = FastAPI(lifespan=lifespan)
+        app.add_middleware(TransientServiceFinalizerMiddleware)
+
+        @app.get("/order")
+        async def order_endpoint(
+            background_tasks: BackgroundTasks,
+            _svc=Inject("transient"),
+        ):
+            background_tasks.add_task(call_order.append, "background")
+            call_order.append("handler")
+            return {"ok": True}
+
+        with TestClient(app) as local_client:
+            response = local_client.get("/order")
+            assert response.status_code == 200
+
+        assert call_order == ["handler", "background", "finalizer"]
 
 
 class TestExceptionMiddleware:
@@ -141,6 +187,7 @@ class TestExceptionMiddleware:
     def test_not_found_exception_keeps_zero_identifier(self):
         exc = NotFoundException("User", 0)
         assert exc.message == "User not found: 0"
+        assert exc.error_code == "NOT_FOUND"
         assert exc.details["identifier"] == "0"
 
     def test_validation_error_debug_body_bytes_are_serializable(self, monkeypatch):

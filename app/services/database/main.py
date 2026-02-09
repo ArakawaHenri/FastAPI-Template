@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncIterator
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -87,7 +87,7 @@ class DatabaseEngineService(BaseService):
         logger.debug(f"Database engine created: {self.db_name}")
 
     @asynccontextmanager
-    async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
+    async def get_session(self) -> AsyncIterator[AsyncSession]:
         """Get a database session with automatic commit/rollback."""
         async with self.async_sessionmaker() as session:
             try:
@@ -122,15 +122,15 @@ class DatabaseSessionServiceT(BaseService):
     Note:
         ServiceContainer infers the injectable service type from the
         factory return annotation. Since ctor returns
-        AsyncGenerator[AsyncSession, None], type-based injection target
+        AsyncIterator[AsyncSession], type-based injection target
         is AsyncSession (not DatabaseSessionServiceT).
     """
 
     class LifespanTasks(BaseService.LifespanTasks):
         @staticmethod
-        async def ctor(engine: DatabaseEngineService) -> AsyncGenerator[AsyncSession, None]:
+        async def ctor(engine: DatabaseEngineService) -> AsyncIterator[AsyncSession]:
             """
-            Async generator factory for database sessions.
+            Async contextmanager-style factory for database sessions.
 
             The engine is injected via nested Inject() at endpoint resolution.
             """

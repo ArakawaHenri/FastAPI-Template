@@ -151,7 +151,7 @@ main.py                       # granian 启动脚本
 ### Lifespan
 
 - 所有服务在 lifespan 中注册与释放，确保生命周期清晰。
-- 使用生成器服务时，用 `yield` 返回实例，并在 `finally` 中清理。
+- 使用 contextmanager 风格服务时，仅 `yield` 一次返回实例，并在 `finally` 中清理。
 - 避免在 import 时创建重资源。
 
 ### 错误处理

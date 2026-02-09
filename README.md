@@ -151,7 +151,7 @@ main.py                       # CLI runner for granian
 ### Lifespan
 
 - Register all services in lifespan to control creation order and teardown.
-- For generator-based services, yield the instance and ensure cleanup in `finally`.
+- For contextmanager-style services, yield the instance exactly once and ensure cleanup in `finally`.
 - Avoid heavy work at import time; defer to lifespan registration.
 
 ### Error handling

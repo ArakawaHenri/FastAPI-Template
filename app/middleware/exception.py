@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from starlette.exceptions import HTTPException
 
+from app.core.dependencies import REQUEST_FAILED_STATE_KEY
 from app.core.settings import settings
 
 # =============================================================================
@@ -40,7 +41,7 @@ class NotFoundException(AppException):
         super().__init__(
             message=message,
             status_code=status.HTTP_404_NOT_FOUND,
-            error_code="RESOURCE_NOT_FOUND",
+            error_code="NOT_FOUND",
             details={
                 "resource": resource,
                 "identifier": str(identifier) if identifier is not None else None,
@@ -147,8 +148,13 @@ def create_error_response(
     return JSONResponse(status_code=status_code, content=content)
 
 
+def _mark_request_failed(request: Request) -> None:
+    setattr(request.state, REQUEST_FAILED_STATE_KEY, True)
+
+
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle request validation errors (422)"""
+    _mark_request_failed(request)
     logger.warning(
         f"Validation error on {request.method} {request.url.path}",
         errors=exc.errors(),
@@ -180,6 +186,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Handle standard HTTP exceptions (404, 405, etc.)"""
+    _mark_request_failed(request)
     logger.info(
         f"HTTP exception on {request.method} {request.url.path}",
         status_code=exc.status_code,
@@ -209,6 +216,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 async def app_exception_handler(request: Request, exc: AppException):
     """Handle custom application exceptions"""
+    _mark_request_failed(request)
     logger.warning(
         f"Application exception on {request.method} {request.url.path}",
         error_code=exc.error_code,
@@ -227,6 +235,7 @@ async def app_exception_handler(request: Request, exc: AppException):
 
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle all uncaught exceptions"""
+    _mark_request_failed(request)
     logger.exception(
         f"Unhandled exception on {request.method} {request.url.path}",
         exc_info=exc

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
-from typing import AsyncGenerator
+from typing import AsyncIterator
 
 import pytest
+from starlette.requests import Request
 
-from app.core.dependencies import ServiceContainer, ServiceLifetime
+from app.core.dependencies import (
+    REQUEST_FAILED_STATE_KEY,
+    ServiceContainer,
+    ServiceLifetime,
+)
 
 
 @pytest.mark.asyncio
@@ -91,7 +96,7 @@ async def test_async_generator_service():
 
     cleanup_called = False
 
-    async def factory() -> AsyncGenerator[dict, None]:
+    async def factory() -> AsyncIterator[dict]:
         nonlocal cleanup_called
         try:
             yield {"data": "test"}
@@ -178,3 +183,188 @@ async def test_key_based_injection():
 
     instance = await container.aget_by_key("my_service")
     assert instance["message"] == "Hello from service"
+
+
+@pytest.mark.asyncio
+async def test_async_generator_transient_finalizer_exhausts_generator():
+    """Transient async generator finalization must execute post-yield logic."""
+    container = ServiceContainer()
+    marks: list[str] = []
+
+    async def factory() -> AsyncIterator[dict[str, bool]]:
+        try:
+            yield {"ok": True}
+        except Exception:
+            marks.append("except")
+            raise
+        else:
+            marks.append("else")
+        finally:
+            marks.append("finally")
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+        "state": {},
+    }
+    request = Request(scope)
+
+    instance = await container.aget_by_key(
+        "gen", **{container.request_kwarg_name(): request}
+    )
+    assert instance == {"ok": True}
+
+    ctx = container._get_or_create_request_ctx(request)
+    for finalizer in reversed(ctx["transient_finalizers"]):
+        await finalizer()
+
+    assert marks == ["else", "finally"]
+
+
+@pytest.mark.asyncio
+async def test_async_generator_transient_finalizer_uses_throw_on_failed_request():
+    """Failed requests should drive transient async generators through rollback path."""
+    container = ServiceContainer()
+    marks: list[str] = []
+
+    async def factory() -> AsyncIterator[dict[str, bool]]:
+        try:
+            yield {"ok": True}
+        except Exception:
+            marks.append("except")
+            raise
+        else:
+            marks.append("else")
+        finally:
+            marks.append("finally")
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+        "state": {},
+    }
+    request = Request(scope)
+    setattr(request.state, REQUEST_FAILED_STATE_KEY, True)
+
+    instance = await container.aget_by_key(
+        "gen", **{container.request_kwarg_name(): request}
+    )
+    assert instance == {"ok": True}
+
+    ctx = container._get_or_create_request_ctx(request)
+    for finalizer in reversed(ctx["transient_finalizers"]):
+        await finalizer()
+
+    assert marks == ["except", "finally"]
+
+
+@pytest.mark.asyncio
+async def test_async_generator_transient_finalizer_rejects_iterator_style_factory():
+    """Iterator-style async generators (multiple yields) violate single-yield contract."""
+    container = ServiceContainer()
+    marks: list[str] = []
+
+    async def factory() -> AsyncIterator[int]:
+        try:
+            yield 1
+            yield 2
+            yield 3
+        finally:
+            marks.append("finally")
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+        "state": {},
+    }
+    request = Request(scope)
+
+    instance = await container.aget_by_key(
+        "gen", **{container.request_kwarg_name(): request}
+    )
+    assert instance == 1
+
+    ctx = container._get_or_create_request_ctx(request)
+    for finalizer in reversed(ctx["transient_finalizers"]):
+        with pytest.raises(RuntimeError, match="must yield exactly once"):
+            await finalizer()
+
+    assert marks == ["finally"]
+
+
+@pytest.mark.asyncio
+async def test_generator_transient_finalizer_rejects_iterator_style_factory():
+    """Iterator-style generators (multiple yields) violate single-yield contract."""
+    container = ServiceContainer()
+    marks: list[str] = []
+
+    def factory():
+        try:
+            yield 1
+            yield 2
+            yield 3
+        finally:
+            marks.append("finally")
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+        "state": {},
+    }
+    request = Request(scope)
+
+    instance = await container.aget_by_key(
+        "gen", **{container.request_kwarg_name(): request}
+    )
+    assert instance == 1
+
+    ctx = container._get_or_create_request_ctx(request)
+    for finalizer in reversed(ctx["transient_finalizers"]):
+        with pytest.raises(RuntimeError, match="must yield exactly once"):
+            await finalizer()
+
+    assert marks == ["finally"]

@@ -5,15 +5,14 @@ import inspect
 import types
 import uuid
 import weakref
-from collections.abc import AsyncGenerator as AsyncGeneratorABC
+from collections.abc import AsyncIterator as AsyncIteratorABC
 from collections.abc import Awaitable as AwaitableABC
 from collections.abc import Coroutine as CoroutineABC
-from collections.abc import Generator as GeneratorABC
+from collections.abc import Iterator as IteratorABC
 from enum import IntEnum
 from typing import (
     Annotated,
     Any,
-    AsyncGenerator,
     Awaitable,
     Callable,
     Optional,
@@ -31,17 +30,18 @@ from loguru import logger
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 T = TypeVar("T")
+REQUEST_FAILED_STATE_KEY = "_svc_request_failed"
 
 # Factory (ctor) may return:
 # - a plain instance T
 # - an Awaitable[T] (async def or sync returning awaitable)
-# - a synchronous Generator[T, Any, Any]
-# - an asynchronous AsyncGenerator[T, Any]
+# - a synchronous contextmanager-style factory via Iterator[T]
+# - an asynchronous contextmanager-style factory via AsyncIterator[T]
 Ctor = Callable[..., Union[
     T,
     Awaitable[T],
-    GeneratorABC[T, Any, Any],
-    AsyncGeneratorABC[T, Any],
+    IteratorABC[T],
+    AsyncIteratorABC[T],
 ]]
 
 # Destructor (dtor): takes an instance T, may be sync or async
@@ -155,7 +155,7 @@ class ServiceContainer:
             - Coroutine factories are awaited directly.
             - Synchronous factories are executed in a background thread
               to avoid blocking the event loop.
-            - Generator / async generator factories are rejected
+            - Contextmanager-style factories (sync/async) are rejected
               (use TRANSIENT lifetime for those).
             """
             if self.instance is not None:
@@ -181,7 +181,7 @@ class ServiceContainer:
 
                 if inspect.isgenerator(result) or inspect.isasyncgen(result):
                     msg = (
-                        "Generator/async-generator factory not allowed for "
+                        "Contextmanager-style factory not allowed for "
                         "SINGLETON services. Use TRANSIENT lifetime instead."
                     )
                     logger.error(msg)
@@ -296,17 +296,17 @@ class ServiceContainer:
         """
         Infer the logical "service type" from the factory's return annotation.
 
-        For non-generator factories:
+        For non-contextmanager factories:
             - async def f() -> MyType: service type is MyType
             - def f() -> MyType: service type is MyType
             - def f() -> Awaitable[MyType] / Coroutine[..., MyType]:
               service type is MyType
 
-        For generator factories:
-            - def f() -> Generator[MyType, Any, Any]: service type is MyType
+        For sync contextmanager-style factories:
+            - def f() -> Iterator[MyType]: service type is MyType
 
-        For async generator factories:
-            - async def f() -> AsyncGenerator[MyType, Any]: service type is MyType
+        For async contextmanager-style factories:
+            - async def f() -> AsyncIterator[MyType]: service type is MyType
 
         If no meaningful annotation can be determined, returns None.
 
@@ -380,15 +380,23 @@ class ServiceContainer:
                     return None
                 origin = get_origin(ann)
 
-        # AsyncGenerator[T, ...] / Generator[T, ...]
-        if origin in (AsyncGenerator, AsyncGeneratorABC, GeneratorABC):
+        # Async/sync contextmanager-style type hints.
+        is_contextmanager_annotation = False
+        if origin is not None:
+            try:
+                is_contextmanager_annotation = issubclass(
+                    origin, (AsyncIteratorABC, IteratorABC)
+                )
+            except TypeError:
+                is_contextmanager_annotation = False
+        if is_contextmanager_annotation:
             args = get_args(ann)
             if args:
                 inner_type = args[0]
                 # Reject unresolved string forward references
                 if isinstance(inner_type, str):
                     logger.warning(
-                        f"Unable to resolve forward reference '{inner_type}' in generator type. "
+                        f"Unable to resolve forward reference '{inner_type}' in contextmanager type. "
                         "For anonymous registration, ensure all type annotations are resolvable."
                     )
                     return None
@@ -566,6 +574,15 @@ class ServiceContainer:
         """
         Core async resolution logic shared by key-based and type-based resolution.
         """
+        class _RequestFailedSignal(Exception):
+            """Internal sentinel to drive contextmanager rollback on failed requests."""
+
+        def _request_failed() -> bool:
+            return (
+                request is not None
+                and bool(getattr(request.state, REQUEST_FAILED_STATE_KEY, False))
+            )
+
         # Enforce single-loop usage for all resolution paths.
         self._ensure_event_loop()
 
@@ -600,22 +617,50 @@ class ServiceContainer:
             if inspect.isawaitable(result):
                 result = await result
 
-        # Async generator.
+        # Async contextmanager-style factory.
         if inspect.isasyncgen(result):
             agen = result
             try:
                 instance = await agen.__anext__()
             except StopAsyncIteration:
                 raise RuntimeError(
-                    f"Async generator service '{key_label}' did not yield a value."
+                    f"Async contextmanager service '{key_label}' did not yield a value."
                 )  # noqa: B904
 
             async def _close_gen() -> None:
-                await agen.aclose()
+                """
+                Finalize a transient async contextmanager service using
+                async-contextmanager semantics (exactly one yield).
+
+                On success, advance once to completion so `else/finally` runs.
+                On failure, throw an internal signal so `except/finally` runs.
+                Any additional yielded value is treated as a contract violation.
+                """
+                try:
+                    if _request_failed():
+                        signal = _RequestFailedSignal()
+                        try:
+                            await agen.athrow(signal)
+                        except StopAsyncIteration:
+                            return
+                        except _RequestFailedSignal:
+                            return
+                        raise RuntimeError(
+                            f"Async contextmanager service '{key_label}' must yield exactly once."
+                        )
+                    try:
+                        await agen.__anext__()
+                    except StopAsyncIteration:
+                        return
+                    raise RuntimeError(
+                        f"Async contextmanager service '{key_label}' must yield exactly once."
+                    )
+                finally:
+                    await agen.aclose()
 
             if dtor:
                 logger.warning(
-                    f"Async generator service '{key_label}' should use `async with` or "
+                    f"Async contextmanager service '{key_label}' should use `async with` or "
                     f"`yield ... finally` for cleanup instead of a separate destructor."
                 )
                 dtor_finalizer = self._make_async_finalizer(dtor, instance)
@@ -630,22 +675,56 @@ class ServiceContainer:
             else:
                 finalizer = _close_gen
 
-        # Synchronous generator.
+        # Synchronous contextmanager-style factory.
         elif inspect.isgenerator(result):
             gen = result
             try:
                 instance = next(gen)
             except StopIteration:
-                msg = f"Generator service '{key_label}' did not yield a value."
+                msg = f"Contextmanager service '{key_label}' did not yield a value."
                 logger.error(msg)
                 raise RuntimeError(msg)  # noqa: B904
 
             async def _close_gen() -> None:
-                await asyncio.to_thread(gen.close)
+                """
+                Finalize a transient contextmanager service using
+                contextmanager semantics (exactly one yield).
+
+                On success, advance once to completion so `else/finally` runs.
+                On failure, throw an internal signal so `except/finally` runs.
+                Any additional yielded value is treated as a contract violation.
+                """
+
+                def _finalize_gen() -> None:
+                    try:
+                        if _request_failed():
+                            signal = _RequestFailedSignal()
+                            try:
+                                gen.throw(signal)
+                            except StopIteration:
+                                return
+                            except _RequestFailedSignal:
+                                return
+                            raise RuntimeError(
+                                f"Contextmanager service '{key_label}' must yield exactly once."
+                            )
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            return
+                        raise RuntimeError(
+                            f"Contextmanager service '{key_label}' must yield exactly once."
+                        )
+                    except _RequestFailedSignal:
+                        return
+                    finally:
+                        gen.close()
+
+                await asyncio.to_thread(_finalize_gen)
 
             if dtor:
                 logger.warning(
-                    f"Generator service '{key_label}' should use `with` or "
+                    f"Contextmanager service '{key_label}' should use `with` or "
                     f"`yield ... finally` for cleanup instead of a separate destructor."
                 )
                 dtor_finalizer = self._make_async_finalizer(dtor, instance)
@@ -699,7 +778,7 @@ class ServiceContainer:
             Service lifetime (singleton or transient).
         ctor:
             Callable that creates the service instance. It may be synchronous,
-            asynchronous, generator-based, or async generator-based depending on
+            asynchronous, contextmanager-style (sync), or contextmanager-style (async) depending on
             the lifetime and usage.
         dtor:
             Optional destructor called when the service is torn down.
@@ -1088,17 +1167,8 @@ class TransientServiceFinalizerMiddleware:
             await self.app(scope, receive, send)
             return
 
-        finalizers_run = False
-
-        async def send_wrapper(message):
-            nonlocal finalizers_run
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                await self._run_finalizers(scope)
-                finalizers_run = True
-            await send(message)
-
         try:
-            await self.app(scope, receive, send_wrapper)
+            await self.app(scope, receive, send)
         finally:
-            if not finalizers_run:
-                await self._run_finalizers(scope)
+            # Run finalizers after response background tasks complete.
+            await asyncio.shield(self._run_finalizers(scope))
