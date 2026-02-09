@@ -7,11 +7,17 @@ import itertools
 import struct
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, TextIO
+from typing import Any, Awaitable, Callable, Optional, TextIO
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
@@ -41,6 +47,13 @@ _CALLBACK_WAIT_POLL_SECONDS = 0.05
 _CALLBACK_MAX_RETRIES = 1
 _CALLBACK_RETRY_BASE_SECONDS = 1
 _CALLBACK_RETRY_MAX_SECONDS = 30
+_DEFAULT_CALLBACK_EXEC_TIMEOUT_SECONDS = 30.0
+_CALLBACK_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5.0
+_RUNTIME_THREAD_START_TIMEOUT_SECONDS = 5.0
+_RUNTIME_THREAD_STOP_TIMEOUT_SECONDS = 5.0
+_RUNTIME_SUBMIT_TIMEOUT_SECONDS = 30.0
+_RUNTIME_MAX_PENDING_CALLS = 1024
+_RUNTIME_BLOCKING_WAIT_POLL_SECONDS = 0.1
 _INTERNAL_OPEN_MAX_DBS = 65535
 
 _MapFullError = getattr(lmdb, "MapFullError", None)
@@ -85,6 +98,12 @@ class _CallbackJob:
     due_ts: int
     event: ExpiryCallbackEvent
     attempts: int
+
+
+@dataclass(frozen=True)
+class _CallbackRegistration:
+    fn: ExpiryCallback
+    timeout_seconds: float
 
 
 class StoreService(BaseService):
@@ -152,10 +171,6 @@ class StoreService(BaseService):
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._tighten_directory_permissions(self._base_dir)
         self._meta_path = self._base_dir / "meta.mdb"
-        self._executor = ThreadPoolExecutor(
-            max_workers=config.worker_threads,
-            thread_name_prefix="store-lmdb",
-        )
 
         self._env = lmdb.open(
             str(self._data_path),
@@ -211,27 +226,49 @@ class StoreService(BaseService):
         self._resize_lock = threading.Lock()
         self._meta_resize_lock = threading.Lock()
         self._write_lock = asyncio.Lock()
-        self._exclusive_locks: dict[str, asyncio.Lock] = {}
+        self._exclusive_locks: dict[str, threading.Lock] = {}
+        self._exclusive_registry_lock = threading.Lock()
+        # Task-local namespace lease state:
+        # namespace -> (lease_id, reentrant_depth)
         self._exclusive_guard = contextvars.ContextVar(
             "store_exclusive_guard", default=None)
+        # Namespace -> currently active lease_id.
+        # A lease is valid only while the underlying asyncio lock is held.
+        self._exclusive_active_leases: dict[str, str] = {}
         self._namespaces: set[str] = set()
         self._internal_namespaces: set[str] = set()
-        self._callback_registry: dict[str, ExpiryCallback] = {}
+        self._callback_registry: dict[str, _CallbackRegistration] = {}
+        self._callback_registry_lock = threading.Lock()
         self._builtin_callbacks: set[str] = set()
-        self._callback_registry_lock = asyncio.Lock()
-        self._callback_task: Optional[asyncio.Task] = None
+        self._callback_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="store-callback",
+        )
+        self._callback_runner_executor = ThreadPoolExecutor(
+            max_workers=config.worker_threads,
+            thread_name_prefix="store-callback-runner",
+        )
+        self._callback_future: Future[Any] | None = None
         self._callback_guard = contextvars.ContextVar(
             "store_callback_guard", default=False)
-        self._callback_dispatch_stop = asyncio.Event()
-        self._callback_wakeup = asyncio.Event()
-        self._callback_active = False
+        self._callback_dispatch_stop = threading.Event()
+        self._callback_wakeup = threading.Event()
+        self._callback_active = threading.Event()
         self._callback_lock_handle = None
 
         self._cleanup_stop = asyncio.Event()
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_lock_handle = None
+        self._runtime_loop: asyncio.AbstractEventLoop | None = None
+        self._runtime_thread: threading.Thread | None = None
+        self._runtime_thread_id: int | None = None
+        self._runtime_ready = threading.Event()
+        self._runtime_submit_semaphore = threading.BoundedSemaphore(
+            _RUNTIME_MAX_PENDING_CALLS
+        )
         self._closed = False
         self._namespaces.update(self._list_namespaces())
+        self._start_runtime_thread()
 
         logger.debug("[STORE] StoreService initialized (zLMDB)")
 
@@ -239,18 +276,88 @@ class StoreService(BaseService):
         def __init__(self, store: "StoreService", namespace: str) -> None:
             self._store = store
             self._namespace = namespace
+            self._lease_id: str | None = None
+            self._task_group: asyncio.TaskGroup | None = None
+            self._enter_depth = 0
 
         async def __aenter__(self) -> "StoreService._ExclusiveNamespaceLock":
-            await self._store._acquire_exclusive(self._namespace)
+            lease_id, owns_lease = await self._store._acquire_exclusive(
+                self._namespace
+            )
+            task_group: asyncio.TaskGroup | None = None
+            try:
+                if owns_lease:
+                    task_group = asyncio.TaskGroup()
+                    await task_group.__aenter__()
+            except Exception:
+                self._store._release_exclusive(self._namespace)
+                raise
+
+            if self._enter_depth == 0:
+                self._lease_id = lease_id
+                if task_group is not None:
+                    self._task_group = task_group
+            elif self._lease_id != lease_id:
+                # Defensive: this should not happen when release/acquire is balanced.
+                self._store._release_exclusive(self._namespace)
+                raise RuntimeError(
+                    f"Exclusive lease switched unexpectedly for namespace '{self._namespace}'."
+                )
+            self._enter_depth += 1
             return self
 
+        def create_task(
+            self,
+            coro: Awaitable[Any],
+            *,
+            name: str | None = None,
+        ) -> asyncio.Task[Any]:
+            if self._task_group is None:
+                raise RuntimeError(
+                    "This lock instance does not own the active lease task group. "
+                    "Create child tasks from the lock object that acquired the lease."
+                )
+            return self._task_group.create_task(coro, name=name)
+
+        def start_soon(
+            self,
+            fn: Callable[..., Awaitable[Any]],
+            *args: Any,
+            **kwargs: Any,
+        ) -> asyncio.Task[Any]:
+            return self.create_task(fn(*args, **kwargs))
+
         async def __aexit__(self, exc_type, exc, tb) -> None:
+            if self._enter_depth <= 0:
+                logger.warning(
+                    "[STORE] Exclusive namespace lock exited without enter",
+                    namespace=self._namespace,
+                )
+                return
+
+            self._enter_depth -= 1
+
+            task_group_error: BaseException | None = None
+            if self._enter_depth == 0 and self._task_group is not None:
+                try:
+                    await self._task_group.__aexit__(exc_type, exc, tb)
+                except BaseException as error:
+                    task_group_error = error
+                finally:
+                    self._task_group = None
+
             self._store._release_exclusive(self._namespace)
+            if self._enter_depth == 0:
+                self._lease_id = None
+
+            if task_group_error is not None:
+                raise task_group_error
 
     def create_namespace_lock(self, namespace: str) -> "StoreService._ExclusiveNamespaceLock":
         self._encode_namespace(namespace)
-        if namespace not in self._exclusive_locks:
-            self._exclusive_locks[namespace] = asyncio.Lock()
+        with self._exclusive_registry_lock:
+            if namespace not in self._exclusive_locks:
+                self._exclusive_locks[namespace] = threading.Lock()
         return StoreService._ExclusiveNamespaceLock(self, namespace)
 
     async def mark_internal_namespace(self, namespace: str) -> None:
@@ -263,6 +370,11 @@ class StoreService(BaseService):
         Args:
             namespace: The namespace to mark as internal
         """
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self.mark_internal_namespace,
+                namespace,
+            )
         self._assert_open()
         self._assert_not_in_callback()
         self._encode_namespace(namespace)
@@ -281,6 +393,8 @@ class StoreService(BaseService):
                 )
 
     async def start_cleanup(self) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(self.start_cleanup)
         self._assert_open()
         if self._cleanup_task is not None:
             return
@@ -295,14 +409,54 @@ class StoreService(BaseService):
             self._cleanup_loop(
                 "store", self.cleanup_expired, self._cleanup_stop)
         )
+        callback_worker_ready = await self._ensure_callback_worker()
+        if not callback_worker_ready:
+            pending_jobs = await self._run_in_executor(self._count_callback_jobs)
+            if pending_jobs > 0:
+                logger.warning(
+                    "[STORE] Callback worker unavailable at startup; pending jobs will wait",
+                    pending_jobs=pending_jobs,
+                )
 
     async def shutdown(self) -> None:
+        if self._closed and not self._is_runtime_thread():
+            await self._stop_runtime_thread()
+            return
+        if not self._is_runtime_thread():
+            try:
+                await self._run_on_runtime_thread(self.shutdown)
+            finally:
+                await self._stop_runtime_thread()
+            return
         if self._closed:
             return
         self._cleanup_stop.set()
         if self._cleanup_task is not None:
             await self._cleanup_task
-        await self._stop_callback_worker()
+        try:
+            drained = await self.wait_for_callbacks(
+                timeout=_CALLBACK_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+                raise_on_incomplete=False,
+            )
+        except Exception:
+            drained = False
+            logger.exception("[STORE] Failed waiting for callback queue drain")
+        if not drained:
+            try:
+                pending_jobs = await self._run_in_executor(self._count_callback_jobs)
+            except Exception:
+                pending_jobs = -1
+            logger.warning(
+                "[STORE] Callback queue not fully drained before shutdown",
+                pending_jobs=pending_jobs,
+                timeout_seconds=_CALLBACK_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+            )
+        stopped = await self._stop_callback_worker()
+        if not stopped:
+            raise RuntimeError(
+                "Callback worker failed to stop cleanly; "
+                "aborting store shutdown to avoid unsafe teardown."
+            )
         await self._run_in_executor(
             self._release_file_lock, self._cleanup_lock_handle
         )
@@ -315,26 +469,46 @@ class StoreService(BaseService):
             self._env.sync()
         finally:
             self._env.close()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            partial(self._executor.shutdown, wait=True, cancel_futures=True),
-        )
         self._closed = True
+        self._callback_executor.shutdown(wait=True, cancel_futures=True)
+        self._callback_runner_executor.shutdown(wait=False, cancel_futures=True)
         logger.debug("[STORE] StoreService shutdown completed")
 
-    async def register_expiry_callback(self, name: str, fn: ExpiryCallback) -> None:
+    async def register_expiry_callback(
+        self,
+        name: str,
+        fn: ExpiryCallback,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self.register_expiry_callback,
+                name,
+                fn,
+                timeout_seconds=timeout_seconds,
+            )
         self._assert_open()
         self._assert_not_in_callback()
         callback_name = self._normalize_callback_name(name)
         if not inspect.iscoroutinefunction(fn):
             raise TypeError("Expiry callback must be an async function")
-        async with self._callback_registry_lock:
-            if callback_name not in self._builtin_callbacks:
-                raise ValueError(
-                    f"Expiry callback '{callback_name}' is not a builtin callback"
-                )
-            self._callback_registry[callback_name] = fn
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else _DEFAULT_CALLBACK_EXEC_TIMEOUT_SECONDS
+        )
+        if callback_name not in self._builtin_callbacks:
+            raise ValueError(
+                f"Expiry callback '{callback_name}' is not a builtin callback"
+            )
+        with self._callback_registry_lock:
+            self._callback_registry[callback_name] = _CallbackRegistration(
+                fn=fn,
+                timeout_seconds=effective_timeout,
+            )
         async with self._write_lock:
             await self._run_in_executor(
                 self._register_callback_name,
@@ -342,17 +516,24 @@ class StoreService(BaseService):
             )
 
     async def register_builtin_callback(self, name: str) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self.register_builtin_callback, name
+            )
         self._assert_open()
         self._assert_not_in_callback()
         callback_name = self._normalize_callback_name(name)
-        async with self._callback_registry_lock:
-            self._builtin_callbacks.add(callback_name)
+        self._builtin_callbacks.add(callback_name)
 
     async def unregister_expiry_callback(self, name: str) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self.unregister_expiry_callback, name
+            )
         self._assert_open()
         self._assert_not_in_callback()
         callback_name = self._normalize_callback_name(name)
-        async with self._callback_registry_lock:
+        with self._callback_registry_lock:
             self._callback_registry.pop(callback_name, None)
         async with self._write_lock:
             await self._run_in_executor(
@@ -360,13 +541,59 @@ class StoreService(BaseService):
                 callback_name,
             )
 
-    async def wait_for_callbacks(self) -> None:
-        await self._ensure_callback_worker()
+    async def wait_for_callbacks(
+        self,
+        timeout: float | None = None,
+        *,
+        raise_on_incomplete: bool = True,
+    ) -> bool:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self.wait_for_callbacks,
+                timeout=timeout,
+                raise_on_incomplete=raise_on_incomplete,
+            )
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be >= 0")
+
+        def _incomplete(reason: str, *, pending: int, elapsed: float) -> bool:
+            logger.warning(
+                "[STORE] Callback queue not fully drained",
+                reason=reason,
+                pending_jobs=pending,
+                elapsed_seconds=round(elapsed, 3),
+                timeout_seconds=timeout,
+            )
+            if raise_on_incomplete:
+                raise TimeoutError(
+                    f"Callback queue not drained: {reason} "
+                    f"(pending_jobs={pending}, elapsed={elapsed:.3f}s)"
+                )
+            return False
+
+        started = time.monotonic()
+        worker_available = await self._ensure_callback_worker()
         while True:
             pending = await self._run_in_executor(self._count_callback_jobs)
-            if pending == 0 and not self._callback_active:
-                return
-            await asyncio.sleep(_CALLBACK_WAIT_POLL_SECONDS)
+            if pending == 0 and not self._callback_active.is_set():
+                return True
+
+            if not worker_available:
+                # Jobs exist but this process cannot run a callback worker now.
+                # Caller can decide whether to retry later.
+                elapsed = time.monotonic() - started
+                return _incomplete("worker_unavailable", pending=pending, elapsed=elapsed)
+
+            sleep_seconds = _CALLBACK_WAIT_POLL_SECONDS
+            if timeout is not None:
+                elapsed = time.monotonic() - started
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    return _incomplete("timeout", pending=pending, elapsed=elapsed)
+                sleep_seconds = min(sleep_seconds, remaining)
+
+            await asyncio.sleep(sleep_seconds)
+            worker_available = await self._ensure_callback_worker()
 
     async def set(
         self,
@@ -376,6 +603,15 @@ class StoreService(BaseService):
         retention: Optional[int] = None,
         on_expire: str | None = None,
     ) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self.set,
+                namespace,
+                key,
+                value,
+                retention,
+                on_expire,
+            )
         self._assert_open()
         self._assert_not_in_callback()
         self._assert_namespace_access(namespace)
@@ -391,11 +627,10 @@ class StoreService(BaseService):
                     "on_expire requires a positive retention (minutes)"
                 )
             callback_name = self._normalize_callback_name(on_expire)
-            async with self._callback_registry_lock:
-                if callback_name not in self._callback_registry:
-                    raise ValueError(
-                        f"Expiry callback '{callback_name}' is not registered"
-                    )
+            if callback_name not in self._callback_registry:
+                raise ValueError(
+                    f"Expiry callback '{callback_name}' is not registered"
+                )
 
         namespace_escaped = self._encode_namespace(namespace)
         key_bytes = self._encode_key(key)
@@ -426,6 +661,8 @@ class StoreService(BaseService):
             raise
 
     async def get(self, namespace: str = "default", key: str = "") -> Optional[object]:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(self.get, namespace, key)
         self._assert_open()
         self._assert_namespace_access(namespace)
         if not key:
@@ -473,6 +710,8 @@ class StoreService(BaseService):
         return True
 
     async def cleanup_expired(self, now: Optional[float] = None) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(self.cleanup_expired, now)
         self._assert_open()
         self._assert_not_in_callback()
         if now is None:
@@ -501,6 +740,12 @@ class StoreService(BaseService):
             raise
 
     async def _register_namespace(self, namespace: str, namespace_escaped: str) -> None:
+        if not self._is_runtime_thread():
+            return await self._run_on_runtime_thread(
+                self._register_namespace,
+                namespace,
+                namespace_escaped,
+            )
         # Keep namespace_lock across the registration sequence so callers cannot
         # observe "registered in memory" before meta persistence succeeds.
         async with self._namespace_lock:
@@ -746,7 +991,10 @@ class StoreService(BaseService):
         now_bucket = int(now // 60)
         bucket_limit = _BUCKET_STRUCT.pack(now_bucket)
         deletes_left = self._config.cleanup_max_deletes
-        expired_items: list[tuple[str, bytes, int, str | None]] = []
+        # (namespace, key_bytes, bucket_key, expire_ts, callback_name)
+        expired_items: list[tuple[str, bytes, bytes, int, str | None]] = []
+        # (namespace, bucket_key, key_bytes)
+        stale_exp_index_entries: list[tuple[str, bytes, bytes]] = []
         escaped_namespaces = {
             namespace: self._encode_namespace(namespace) for namespace in namespaces
         }
@@ -791,11 +1039,10 @@ class StoreService(BaseService):
             _resolve_meta(namespace)
 
         try:
-            def _cleanup(meta_txn) -> None:
-                nonlocal deletes_left
+            with self._meta_env.begin(write=False) as meta_txn:
                 for namespace in namespaces:
                     if deletes_left <= 0:
-                        return
+                        break
                     exp_db = exp_dbs[namespace]
                     expmeta_db = expmeta_dbs[namespace]
                     callback_db = callback_dbs[namespace]
@@ -808,6 +1055,7 @@ class StoreService(BaseService):
                             if bucket_key is None or bucket_key > bucket_limit:
                                 break
 
+                            bucket_key_bytes = bytes(bucket_key)
                             dup_iter = cursor.iternext_dup()
                             dup_entries = list(
                                 itertools.islice(dup_iter, deletes_left))
@@ -835,8 +1083,9 @@ class StoreService(BaseService):
                                     else:
                                         expire_ts = expmeta_ts or payload_ts
                                 if expire_ts == 0 or expire_ts > now:
-                                    meta_txn.delete(
-                                        bucket_key, key_bytes, db=exp_db)
+                                    stale_exp_index_entries.append(
+                                        (namespace, bucket_key_bytes, key_bytes)
+                                    )
                                     continue
 
                                 callback_raw = meta_txn.get(
@@ -847,30 +1096,27 @@ class StoreService(BaseService):
                                         callback_raw
                                     )
 
-                                meta_txn.delete(
-                                    bucket_key, key_bytes, db=exp_db)
-                                meta_txn.delete(key_bytes, db=expmeta_db)
-                                meta_txn.delete(key_bytes, db=callback_db)
                                 deletes_left -= 1
 
                                 expired_items.append(
-                                    (namespace, key_bytes, expire_ts, callback_name)
+                                    (
+                                        namespace,
+                                        key_bytes,
+                                        bucket_key_bytes,
+                                        expire_ts,
+                                        callback_name,
+                                    )
                                 )
 
                                 if deletes_left <= 0:
-                                    return
+                                    break
 
                             if not cursor.next_nodup():
                                 break
 
-            self._write_meta_txn_with_resize(_cleanup, 0)
-
-            if not expired_items:
-                return []
-
             expired_events: list[ExpiryCallbackEvent] = []
-            if any(item[3] for item in expired_items):
-                for namespace, key_bytes, expire_ts, callback_name in expired_items:
+            if any(item[4] for item in expired_items):
+                for namespace, key_bytes, _, expire_ts, callback_name in expired_items:
                     if not callback_name:
                         continue
                     data_txn, data_db = _resolve_data(namespace)
@@ -888,14 +1134,32 @@ class StoreService(BaseService):
             for txn in data_txns.values():
                 txn.abort()
 
-        def _delete_data(txn) -> None:
-            for namespace, key_bytes, _, _ in expired_items:
-                db = data_dbs.get(namespace)
-                if db is None:
-                    continue
-                txn.delete(key_bytes, db=db)
+        if expired_items:
+            def _delete_data(txn) -> None:
+                for namespace, key_bytes, _, _, _ in expired_items:
+                    db = data_dbs.get(namespace)
+                    if db is None:
+                        continue
+                    txn.delete(key_bytes, db=db)
 
-        self._write_data_txn_with_resize(_delete_data, 0)
+            self._write_data_txn_with_resize(_delete_data, 0)
+
+        if stale_exp_index_entries or expired_items:
+            def _delete_meta(txn) -> None:
+                for namespace, bucket_key, key_bytes in stale_exp_index_entries:
+                    exp_db = exp_dbs[namespace]
+                    txn.delete(bucket_key, key_bytes, db=exp_db)
+
+                for namespace, key_bytes, bucket_key, _, _ in expired_items:
+                    exp_db = exp_dbs[namespace]
+                    expmeta_db = expmeta_dbs[namespace]
+                    callback_db = callback_dbs[namespace]
+                    txn.delete(bucket_key, key_bytes, db=exp_db)
+                    txn.delete(key_bytes, db=expmeta_db)
+                    txn.delete(key_bytes, db=callback_db)
+
+            self._write_meta_txn_with_resize(_delete_meta, 0)
+
         return expired_events
 
     def _ensure_capacity(
@@ -1139,60 +1403,165 @@ class StoreService(BaseService):
             )
 
     def _assert_namespace_access(self, namespace: str) -> None:
-        lock = self._exclusive_locks.get(namespace)
+        with self._exclusive_registry_lock:
+            lock = self._exclusive_locks.get(namespace)
+            active_lease_id = self._exclusive_active_leases.get(namespace)
         if lock is None:
             return
-        state = self._exclusive_guard.get()
-        if not state or state.get(namespace, 0) <= 0:
+        state = self._exclusive_guard.get() or {}
+        lease_entry = state.get(namespace)
+        if lease_entry is None:
             raise RuntimeError(
-                f"Namespace '{namespace}' is exclusive; use store.exclusive('{namespace}') to access it."
+                f"Namespace '{namespace}' is exclusive; "
+                f"use store.create_namespace_lock('{namespace}') to access it."
+            )
+        lease_id, _depth = lease_entry
+        if active_lease_id != lease_id:
+            raise RuntimeError(
+                f"Namespace '{namespace}' exclusive lease is no longer active. "
+                f"Reacquire via store.create_namespace_lock('{namespace}')."
             )
 
-    async def _acquire_exclusive(self, namespace: str) -> None:
-        lock = self._exclusive_locks.get(namespace)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._exclusive_locks[namespace] = lock
-        state = self._exclusive_guard.get()
-        if state and state.get(namespace, 0) > 0:
+    async def _acquire_exclusive(self, namespace: str) -> tuple[str, bool]:
+        with self._exclusive_registry_lock:
+            lock = self._exclusive_locks.get(namespace)
+            if lock is None:
+                lock = threading.Lock()
+                self._exclusive_locks[namespace] = lock
+
+        state = self._exclusive_guard.get() or {}
+        lease_entry = state.get(namespace)
+        with self._exclusive_registry_lock:
+            active_lease_id = self._exclusive_active_leases.get(namespace)
+        if lease_entry is not None:
+            lease_id, depth = lease_entry
+            if depth > 0 and active_lease_id == lease_id:
+                new_state = dict(state)
+                new_state[namespace] = (lease_id, depth + 1)
+                self._exclusive_guard.set(new_state)
+                return lease_id, False
+            # Drop stale inherited state and reacquire a fresh lease.
             new_state = dict(state)
-            new_state[namespace] = state.get(namespace, 0) + 1
+            new_state.pop(namespace, None)
             self._exclusive_guard.set(new_state)
-            return
-        await lock.acquire()
-        state = self._exclusive_guard.get()
-        new_state = dict(state) if state else {}
-        new_state[namespace] = 1
+            state = new_state
+
+        acquired = await self._await_cancellable_thread_call(
+            partial(self._acquire_thread_lock_cancellable, lock)
+        )
+        if not acquired:
+            raise asyncio.CancelledError()
+        lease_id = uuid4().hex
+        with self._exclusive_registry_lock:
+            self._exclusive_active_leases[namespace] = lease_id
+        new_state = dict(state)
+        new_state[namespace] = (lease_id, 1)
         self._exclusive_guard.set(new_state)
+        return lease_id, True
 
     def _release_exclusive(self, namespace: str) -> None:
         state = self._exclusive_guard.get() or {}
-        count = state.get(namespace, 0)
-        if count <= 0:
+        lease_entry = state.get(namespace)
+        if lease_entry is None:
             logger.warning(
                 "[STORE] Exclusive namespace release without acquisition",
                 namespace=namespace,
             )
             return
-        lock = self._exclusive_locks.get(namespace)
+        lease_id, depth = lease_entry
+
+        if depth > 1:
+            new_state = dict(state)
+            new_state[namespace] = (lease_id, depth - 1)
+            self._exclusive_guard.set(new_state)
+            return
+
+        new_state = dict(state)
+        new_state.pop(namespace, None)
+        self._exclusive_guard.set(new_state)
+
+        with self._exclusive_registry_lock:
+            active_lease_id = self._exclusive_active_leases.get(namespace)
+        if active_lease_id != lease_id:
+            logger.warning(
+                "[STORE] Exclusive namespace lease mismatch during release",
+                namespace=namespace,
+                expected_lease=active_lease_id,
+                local_lease=lease_id,
+            )
+            return
+
+        with self._exclusive_registry_lock:
+            lock = self._exclusive_locks.get(namespace)
+            self._exclusive_active_leases.pop(namespace, None)
         if lock is None:
             logger.warning(
                 "[STORE] Exclusive namespace lock missing during release",
                 namespace=namespace,
             )
             return
-        if count == 1:
-            new_state = dict(state)
-            new_state.pop(namespace, None)
-            self._exclusive_guard.set(new_state)
+        if lock.locked():
             lock.release()
-        else:
-            new_state = dict(state)
-            new_state[namespace] = count - 1
-            self._exclusive_guard.set(new_state)
+            return
+        logger.warning(
+            "[STORE] Exclusive namespace lock already released",
+            namespace=namespace,
+        )
 
     async def _run_in_executor(self, fn, *args, **kwargs):
-        return await _runtime.run_in_executor(self._executor, fn, *args, **kwargs)
+        if kwargs:
+            fn = partial(fn, **kwargs)
+        return fn(*args)
+
+    async def _await_cancellable_thread_call(
+        self,
+        fn: Callable[[threading.Event], Any],
+    ) -> Any:
+        cancel_event = threading.Event()
+        waiter = asyncio.create_task(asyncio.to_thread(fn, cancel_event))
+        try:
+            return await waiter
+        except asyncio.CancelledError:
+            cancel_event.set()
+            try:
+                await waiter
+            except Exception:
+                logger.exception("[STORE] Cancellation cleanup for thread wait failed")
+            raise
+
+    @staticmethod
+    def _acquire_thread_lock_cancellable(
+        lock: threading.Lock,
+        cancel_event: threading.Event,
+    ) -> bool:
+        while not cancel_event.is_set():
+            acquired = lock.acquire(timeout=_RUNTIME_BLOCKING_WAIT_POLL_SECONDS)
+            if not acquired:
+                continue
+            if cancel_event.is_set():
+                lock.release()
+                return False
+            return True
+        return False
+
+    def _acquire_runtime_submit_slot(
+        self,
+        cancel_event: threading.Event,
+    ) -> bool:
+        deadline = time.monotonic() + _RUNTIME_SUBMIT_TIMEOUT_SECONDS
+        while not cancel_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait_seconds = min(_RUNTIME_BLOCKING_WAIT_POLL_SECONDS, remaining)
+            acquired = self._runtime_submit_semaphore.acquire(timeout=wait_seconds)
+            if not acquired:
+                continue
+            if cancel_event.is_set():
+                self._runtime_submit_semaphore.release()
+                return False
+            return True
+        return False
 
     @staticmethod
     def _try_acquire_file_lock(path: Path) -> Optional[TextIO]:
@@ -1219,18 +1588,30 @@ class StoreService(BaseService):
     ) -> None:
         await _runtime.cleanup_loop(name, cleanup_fn, stop_event, interval_seconds)
 
-    async def _ensure_callback_worker(self) -> None:
-        if self._callback_task is not None and not self._callback_task.done():
-            return
+    async def _ensure_callback_worker(self) -> bool:
+        if self._callback_future is not None:
+            if not self._callback_future.done():
+                return True
+            try:
+                self._callback_future.result()
+            except Exception:
+                logger.exception("[STORE] Callback worker exited with exception")
+            finally:
+                self._callback_future = None
         self._callback_lock_handle = await self._run_in_executor(
             self._try_acquire_file_lock,
             self._base_dir / ".store_callbacks.lock",
         )
         if self._callback_lock_handle is None:
             logger.info("[STORE] Callback worker skipped (lock not acquired)")
-            return
-        self._callback_dispatch_stop = asyncio.Event()
-        self._callback_task = asyncio.create_task(self._callback_worker())
+            return False
+        self._callback_dispatch_stop = threading.Event()
+        self._callback_wakeup = threading.Event()
+        self._callback_active.clear()
+        self._callback_future = self._callback_executor.submit(
+            self._callback_worker_main
+        )
+        return True
 
     async def _enqueue_callbacks(self, events: list[ExpiryCallbackEvent]) -> None:
         if not events:
@@ -1239,61 +1620,61 @@ class StoreService(BaseService):
         await self._run_in_executor(self._persist_callback_jobs, events)
         self._callback_wakeup.set()
 
-    async def _callback_worker(self) -> None:
+    def _callback_worker_main(self) -> None:
         try:
             while not self._callback_dispatch_stop.is_set():
-                job = await self._run_in_executor(
-                    self._peek_due_callback_job, int(time.time())
-                )
+                job = self._peek_due_callback_job(int(time.time()))
                 if job is None:
+                    self._callback_wakeup.wait(timeout=_CALLBACK_POLL_INTERVAL_SECONDS)
                     self._callback_wakeup.clear()
-                    try:
-                        await asyncio.wait_for(
-                            self._callback_wakeup.wait(),
-                            timeout=_CALLBACK_POLL_INTERVAL_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        continue
                     continue
 
                 should_complete = False
-                self._callback_active = True
+                self._callback_active.set()
                 try:
-                    should_complete = await self._run_callback(job.event)
+                    should_complete = self._run_callback(job.event)
                 finally:
-                    self._callback_active = False
+                    self._callback_active.clear()
 
                 if should_complete:
-                    await self._run_in_executor(
-                        self._complete_callback_job,
+                    self._complete_callback_job(
                         job.due_ts,
                         job.job_id,
                     )
                 else:
-                    await self._run_in_executor(
-                        self._retry_callback_job,
-                        job,
-                    )
+                    self._retry_callback_job(job)
+        except Exception:
+            logger.exception("[STORE] Expiry callback worker failed")
         finally:
             self._release_file_lock(self._callback_lock_handle)
             self._callback_lock_handle = None
             logger.debug("[STORE] Expiry callback worker stopped")
 
-    async def _stop_callback_worker(self) -> None:
-        if self._callback_task is None:
+    async def _stop_callback_worker(self) -> bool:
+        if self._callback_future is None:
             await self._run_in_executor(
                 self._release_file_lock, self._callback_lock_handle
             )
             self._callback_lock_handle = None
-            return
+            return True
+
         self._callback_dispatch_stop.set()
         self._callback_wakeup.set()
-        await self._callback_task
-        self._callback_task = None
+        future = self._callback_future
+        try:
+            await asyncio.wrap_future(future)
+        except Exception:
+            logger.exception("[STORE] Callback worker stopped with exception")
+            return False
+        finally:
+            if future.done():
+                self._callback_future = None
+        return future.done()
 
-    async def _run_callback(self, event: ExpiryCallbackEvent) -> bool:
-        callback = self._callback_registry.get(event.callback)
-        if callback is None:
+    def _run_callback(self, event: ExpiryCallbackEvent) -> bool:
+        with self._callback_registry_lock:
+            registration = self._callback_registry.get(event.callback)
+        if registration is None:
             logger.error(
                 "[STORE] Expiry callback not registered; skipping",
                 callback=event.callback,
@@ -1301,11 +1682,26 @@ class StoreService(BaseService):
                 key=event.key,
             )
             return True
-        token = self._callback_guard.set(True)
+        callback = registration.fn
+        timeout_seconds = registration.timeout_seconds
+        future = self._callback_runner_executor.submit(
+            self._execute_callback_in_runner,
+            callback,
+            event,
+        )
         try:
-            async with self._write_lock:
-                await callback(event)
+            future.result(timeout=timeout_seconds)
             return True
+        except FutureTimeoutError:
+            future.cancel()
+            logger.warning(
+                "[STORE] Expiry callback timed out",
+                callback=event.callback,
+                namespace=event.namespace,
+                key=event.key,
+                timeout_seconds=timeout_seconds,
+            )
+            return False
         except Exception:
             logger.exception(
                 "[STORE] Expiry callback failed",
@@ -1314,8 +1710,124 @@ class StoreService(BaseService):
                 key=event.key,
             )
             return False
+
+    def _execute_callback_in_runner(
+        self,
+        callback: ExpiryCallback,
+        event: ExpiryCallbackEvent,
+    ) -> None:
+        token = self._callback_guard.set(True)
+        try:
+            asyncio.run(callback(event))
         finally:
             self._callback_guard.reset(token)
+
+    def _is_runtime_thread(self) -> bool:
+        return self._runtime_thread_id == threading.get_ident()
+
+    def _start_runtime_thread(self) -> None:
+        if self._runtime_thread is not None:
+            return
+        self._runtime_ready.clear()
+        self._runtime_thread = threading.Thread(
+            target=self._runtime_thread_main,
+            name="store-runtime",
+            daemon=True,
+        )
+        self._runtime_thread.start()
+        if not self._runtime_ready.wait(timeout=_RUNTIME_THREAD_START_TIMEOUT_SECONDS):
+            loop = self._runtime_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+            self._runtime_thread.join(timeout=_RUNTIME_THREAD_STOP_TIMEOUT_SECONDS)
+            if self._runtime_thread.is_alive():
+                raise RuntimeError(
+                    "StoreService runtime thread failed to start and could not be stopped"
+                )
+            self._runtime_thread = None
+            self._runtime_loop = None
+            self._runtime_thread_id = None
+            raise RuntimeError(
+                "StoreService runtime thread did not start within timeout"
+            )
+        if self._runtime_loop is None:
+            raise RuntimeError("StoreService runtime thread failed to start")
+
+    def _runtime_thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._runtime_loop = loop
+        self._runtime_thread_id = threading.get_ident()
+        asyncio.set_event_loop(loop)
+        self._runtime_ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            asyncio.set_event_loop(None)
+            loop.close()
+            self._runtime_loop = None
+            self._runtime_thread_id = None
+
+    async def _run_on_runtime_thread(self, fn, *args, **kwargs):
+        if self._is_runtime_thread():
+            return await fn(*args, **kwargs)
+        loop = self._runtime_loop
+        if loop is None:
+            if self._closed:
+                raise RuntimeError("StoreService is closed")
+            raise RuntimeError("StoreService runtime loop is unavailable")
+        acquired = await self._await_cancellable_thread_call(
+            self._acquire_runtime_submit_slot
+        )
+        if not acquired:
+            raise TimeoutError("StoreService runtime queue is saturated")
+
+        released = False
+        released_lock = threading.Lock()
+
+        def _release_slot(_fut=None) -> None:
+            nonlocal released
+            with released_lock:
+                if released:
+                    return
+                released = True
+            self._runtime_submit_semaphore.release()
+
+        try:
+            coro = fn(*args, **kwargs)
+        except Exception:
+            _release_slot()
+            raise
+        if not inspect.isawaitable(coro):
+            _release_slot()
+            raise TypeError("Runtime-dispatched function must return an awaitable")
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            coro.close()
+            _release_slot()
+            raise
+        future.add_done_callback(_release_slot)
+        return await asyncio.wrap_future(future)
+
+    async def _stop_runtime_thread(self) -> None:
+        thread = self._runtime_thread
+        loop = self._runtime_loop
+        if thread is None:
+            return
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        await asyncio.to_thread(thread.join, _RUNTIME_THREAD_STOP_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            raise RuntimeError("StoreService runtime thread did not stop in time")
+        self._runtime_thread = None
 
     @staticmethod
     def _encode_callback_job_payload(event: ExpiryCallbackEvent, attempts: int) -> bytes:

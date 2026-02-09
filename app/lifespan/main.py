@@ -108,7 +108,7 @@ async def lifespan(app: FastAPI):
             settings.store_lmdb.max_namespace_bytes,
             settings.store_lmdb.max_value_bytes,
             settings.store_lmdb.cleanup_max_deletes,
-            settings.store_lmdb.worker_threads,
+            settings.store_lmdb.callback_worker_threads,
         )
         store_service: StoreService = await app.state.services.aget_by_type(StoreService)
 
@@ -124,7 +124,8 @@ async def lifespan(app: FastAPI):
             settings.tmp_worker_threads,
             settings.tmp_max_file_size_mb,
             settings.tmp_max_total_size_mb,
-            store_provider=lambda: app.state.services.aget_by_type(StoreService),
+            store_provider=lambda: app.state.services.aget_by_type(
+                StoreService),
         )
         temp_file_service: TempFileService = await app.state.services.aget_by_type(
             TempFileService

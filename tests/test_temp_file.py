@@ -304,6 +304,73 @@ async def test_save_overwrite_is_not_deleted_by_stale_expiry_callback(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_save_overwrite_metadata_failure_restores_previous_file(
+    tmp_path: Path, monkeypatch
+):
+    service, store = await _make_service(tmp_path)
+    await service.save_overwrite("same.txt", "old")
+
+    original_set_metadata = service._set_metadata
+    failed_once = False
+
+    async def fail_once(*args, **kwargs):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("metadata down")
+        return await original_set_metadata(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_set_metadata", fail_once)
+
+    with pytest.raises(RuntimeError, match="metadata down"):
+        await service.save_overwrite("same.txt", "new")
+
+    assert await service.read("same.txt") == "old"
+
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_internal_artifacts_are_not_adopted_and_stale_artifacts_are_cleaned(
+    tmp_path: Path,
+):
+    service, store = await _make_service(tmp_path)
+
+    fresh_name = service._new_staging_name("fresh.txt")
+    stale_name = service._new_backup_name("stale.txt")
+    now = time.time()
+    stale_time = now - TempFileService.INTERNAL_ARTIFACT_RETENTION_SECONDS - 10
+
+    await service._run_in_executor(
+        service._write_staging_file, fresh_name, b"fresh", now
+    )
+    await service._run_in_executor(
+        service._write_staging_file, stale_name, b"stale", stale_time
+    )
+
+    await service.shutdown()
+    await store.shutdown()
+
+    service2, store2 = await _make_service(tmp_path)
+    base_dir = Path(service2._config.base_dir)
+
+    assert (base_dir / fresh_name).exists()
+    assert not (base_dir / stale_name).exists()
+
+    async with store2.create_namespace_lock(service2._namespace):
+        assert await store2.get(service2._namespace, fresh_name) is None
+
+    await service2.cleanup_expired(
+        now=time.time() + TempFileService.INTERNAL_ARTIFACT_RETENTION_SECONDS + 20
+    )
+    assert not (base_dir / fresh_name).exists()
+
+    await service2.shutdown()
+    await store2.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_expired_removes_files(tmp_path: Path):
     service, store = await _make_service(tmp_path, retention_days=1)
     name = await service.save("old.txt", "stale")
@@ -334,3 +401,27 @@ async def test_cleanup_untracked_files(tmp_path: Path):
     assert not untracked.exists()
     await service.shutdown()
     await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_cleanup_reclaims_total_size_counter(tmp_path: Path):
+    service, store = await _make_service(tmp_path, retention_days=1, max_total_size_mb=1)
+    base_dir = Path(service._config.base_dir)
+
+    # Create an untracked stale file that should be removed during bootstrap.
+    stale = base_dir / "stale.bin"
+    stale.write_bytes(b"x" * (800 * 1024))
+    old = time.time() - 2 * 24 * 60 * 60
+    os.utime(stale, (old, old))
+
+    await service.shutdown()
+    await store.shutdown()
+
+    service2, store2 = await _make_service(tmp_path, retention_days=1, max_total_size_mb=1)
+    assert not stale.exists()
+
+    saved = await service2.save("new.bin", b"y" * (500 * 1024))
+    assert saved == "new.bin"
+
+    await service2.shutdown()
+    await store2.shutdown()

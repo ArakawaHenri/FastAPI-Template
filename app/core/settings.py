@@ -29,7 +29,8 @@ class StoreLMDBSettings(BaseModel):
     max_namespace_bytes: int = 256
     max_value_bytes: int = 100 * 1024 * 1024
     cleanup_max_deletes: int = 100_000
-    worker_threads: int = 4
+    # Size of the fixed callback execution thread pool.
+    callback_worker_threads: int = Field(default=4, ge=1)
 
 
 class Settings(BaseSettings):
@@ -47,7 +48,8 @@ class Settings(BaseSettings):
     tmp_dir: str = "./tmp"
     tmp_retention_days: int = 3
     tmp_cleanup_interval_seconds: int = 60
-    tmp_worker_threads: int = 4
+    # Size of TempFileService fixed thread pool.
+    tmp_worker_threads: int = Field(default=4, ge=1)
     tmp_max_file_size_mb: int = 1024
     tmp_max_total_size_mb: int = 0
     debug_mode: bool = False

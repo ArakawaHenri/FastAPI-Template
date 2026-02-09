@@ -55,8 +55,8 @@ uv run python main.py --host 0.0.0.0 --port 8000
 - `RELOAD`：开发用热重载开关。
 - `CORS_ORIGINS`：允许来源列表，JSON 数组格式（示例：`["https://example.com"]`）。
 - `LOG_DIR`：日志目录（不存在会自动创建）。
-- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`：临时文件存储、保留时间及大小上限（`TempFileService`）。
-- `STORE_LMDB__*`：LMDB 存储配置（见下方说明）。
+- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_WORKER_THREADS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`：临时文件存储、固定线程池大小、保留时间及大小上限（`TempFileService`）。
+- `STORE_LMDB__*`：LMDB 存储配置（含回调执行固定线程池大小 `STORE_LMDB__WORKER_THREADS`，见下方说明）。
 - `SEMAPHORES__<name>`：信号量配置（使用 `env_nested_delimiter="__"`）。
 - `DATABASE__<name>__*`：数据库嵌套配置。示例默认使用 MySQL + `aiomysql`。
 
@@ -74,10 +74,12 @@ uv run python main.py --host 0.0.0.0 --port 8000
 | `LOG_DIR` | string | `./logs` | 自动创建 |
 | `TMP_DIR` | string | `./tmp` | 临时文件目录 |
 | `TMP_RETENTION_DAYS` | int | `3` | 临时文件保留天数 |
+| `TMP_WORKER_THREADS` | int | `4` | TempFileService 固定线程池大小 |
 | `TMP_MAX_FILE_SIZE_MB` | int | `1024` | 单个临时文件大小上限（`0` 表示不限） |
 | `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | 临时目录总大小上限（`0` 表示不限） |
 | `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | SQLAlchemy 异步连接串 |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB 存储路径 |
+| `STORE_LMDB__WORKER_THREADS` | int | `4` | Store 过期回调执行固定线程池大小 |
 | `STORE_LMDB__MAX_DBS` | int | `256` | 必须 `>= 0`（`0` 表示关闭用户 namespace 配额） |
 | `SEMAPHORES__db` | int | `5` | 嵌套配置示例 |
 | `SEMAPHORES__example` | int | `10` | `/api/v1/example/` 示例路由使用 |
@@ -276,3 +278,4 @@ if "@" not in email:
 - 在请求上下文之外解析瞬态服务时，析构器不会自动执行。
 - 临时文件容量超限（`TMP_MAX_FILE_SIZE_MB`、`TMP_MAX_TOTAL_SIZE_MB`）会记录 `error` 并向调用方抛出 `ValueError`，但不会导致服务退出。
 - 活跃 worker 中缺少对应过期回调名时会记录 `error`；请确保所有 worker 回调注册一致。
+- namespace 独占访问 API 已迁移为 `create_namespace_lock()`；旧的 `exclusive()` 不再使用。

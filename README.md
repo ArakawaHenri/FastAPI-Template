@@ -55,8 +55,8 @@ Settings are loaded via `pydantic-settings` from environment variables and `.env
 - `RELOAD`: development-only hot reload flag for local runs.
 - `CORS_ORIGINS`: JSON list of allowed origins (example: `["https://example.com"]`).
 - `LOG_DIR`: log output directory (created automatically if missing).
-- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`: temp file storage and size limits for `TempFileService`.
-- `STORE_LMDB__*`: LMDB store configuration (see notes below).
+- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_WORKER_THREADS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`: temp file storage, fixed pool size, and size limits for `TempFileService`.
+- `STORE_LMDB__*`: LMDB store configuration (including callback runner pool size via `STORE_LMDB__WORKER_THREADS`; see notes below).
 - `SEMAPHORES__<name>`: nested config for semaphore services (uses `env_nested_delimiter="__"`).
 - `DATABASE__<name>__*`: nested database config. Defaults in examples use MySQL + `aiomysql`.
 
@@ -74,10 +74,12 @@ Use `.env.production_example` and `.env.debug_example` as starting points.
 | `LOG_DIR` | string | `./logs` | Created automatically |
 | `TMP_DIR` | string | `./tmp` | Temp file base directory |
 | `TMP_RETENTION_DAYS` | int | `3` | Temp file retention days |
+| `TMP_WORKER_THREADS` | int | `4` | TempFileService fixed thread-pool size |
 | `TMP_MAX_FILE_SIZE_MB` | int | `1024` | Max size per temp file (`0` means unlimited) |
 | `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | Max total size of temp dir (`0` means unlimited) |
 | `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | Async SQLAlchemy URL |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB store path |
+| `STORE_LMDB__WORKER_THREADS` | int | `4` | Store expiry-callback fixed thread-pool size |
 | `STORE_LMDB__MAX_DBS` | int | `256` | Must be `>= 0` (`0` disables user-namespace quota) |
 | `SEMAPHORES__db` | int | `5` | Example nested config |
 | `SEMAPHORES__example` | int | `10` | Used by `/api/v1/example/` demo route |
@@ -276,3 +278,4 @@ if "@" not in email:
 - If transient services are resolved outside of a request context, their destructors will not run automatically.
 - Temp-file size-limit breaches (`TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`) are logged as `error` and raised to callers as `ValueError`; the service continues running.
 - Expiry callback names missing in the active worker are logged as `error`; register callbacks consistently across workers.
+- Namespace-exclusive access now uses `create_namespace_lock()`; the legacy `exclusive()` API has been migrated.

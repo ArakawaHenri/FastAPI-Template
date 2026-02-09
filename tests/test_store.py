@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import threading
 import time
 import traceback
 from multiprocessing import get_context
@@ -135,8 +136,8 @@ async def test_get_missing_key_returns_none(tmp_path):
 async def test_store_expiry_callback(tmp_path):
     store = _make_store(tmp_path)
     events: list[tuple[str, str, object | None, int]] = []
-    callback_ran = asyncio.Event()
-    write_blocked = asyncio.Event()
+    callback_ran = threading.Event()
+    write_blocked = threading.Event()
 
     async def on_expire(event):
         events.append((event.namespace, event.key, event.value, event.expire_ts))
@@ -151,7 +152,7 @@ async def test_store_expiry_callback(tmp_path):
     await store.set("default", "k1", "v1", retention=1, on_expire="on_expire")
 
     await store.cleanup_expired(now=time.time() + 120)
-    await asyncio.wait_for(callback_ran.wait(), timeout=2)
+    await asyncio.wait_for(asyncio.to_thread(callback_ran.wait), timeout=2)
     await store.wait_for_callbacks()
 
     assert write_blocked.is_set()
@@ -169,7 +170,7 @@ async def test_store_expiry_callback(tmp_path):
 async def test_store_expiry_callback_retries_then_succeeds(tmp_path):
     store = _make_store(tmp_path)
     attempts = 0
-    callback_done = asyncio.Event()
+    callback_done = threading.Event()
 
     async def flaky(event):
         nonlocal attempts
@@ -184,12 +185,55 @@ async def test_store_expiry_callback_retries_then_succeeds(tmp_path):
     await store.set("default", "k1", "v1", retention=1, on_expire="flaky")
 
     await store.cleanup_expired(now=time.time() + 120)
-    await asyncio.wait_for(callback_done.wait(), timeout=5)
+    await asyncio.wait_for(asyncio.to_thread(callback_done.wait), timeout=5)
     await asyncio.wait_for(store.wait_for_callbacks(), timeout=5)
 
     assert attempts == 2
     assert store._count_callback_jobs() == 0
     assert store._count_dead_letter_callback_jobs() == 0
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_store_expiry_callback_timeout_retries_then_dead_letters(tmp_path):
+    store = _make_store(tmp_path)
+    attempts = 0
+
+    async def slow_callback(_event):
+        nonlocal attempts
+        attempts += 1
+        await asyncio.sleep(0.2)
+
+    await store.register_builtin_callback("slow")
+    await store.register_expiry_callback("slow", slow_callback, timeout_seconds=0.05)
+    await store.set("default", "k1", "v1", retention=1, on_expire="slow")
+
+    await store.cleanup_expired(now=time.time() + 120)
+    drained = await store.wait_for_callbacks(timeout=5)
+
+    assert drained is True
+    assert attempts == 2
+    assert store._count_callback_jobs() == 0
+    assert store._count_dead_letter_callback_jobs() == 1
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_register_expiry_callback_rejects_non_positive_timeout(tmp_path):
+    store = _make_store(tmp_path)
+
+    async def callback(_event):
+        return None
+
+    await store.register_builtin_callback("invalid_timeout")
+    with pytest.raises(ValueError, match="timeout_seconds must be > 0"):
+        await store.register_expiry_callback(
+            "invalid_timeout",
+            callback,
+            timeout_seconds=0,
+        )
 
     await store.shutdown()
 
@@ -219,6 +263,104 @@ async def test_store_expiry_callback_moves_to_dead_letter_after_retry_limit(tmp_
 
 
 @pytest.mark.asyncio
+async def test_wait_for_callbacks_returns_false_when_worker_unavailable(tmp_path):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    async def blocked_callback(_event):
+        return None
+
+    await store.register_builtin_callback("blocked")
+    await store.register_expiry_callback("blocked", blocked_callback)
+
+    await store.set("default", "k1", "v1", retention=1, on_expire="blocked")
+    await store.cleanup_expired(now=time.time() + 120)
+
+    drained = await store.wait_for_callbacks(timeout=1, raise_on_incomplete=False)
+    assert drained is False
+    assert store._count_callback_jobs() > 0
+
+    StoreService._release_file_lock(callback_lock)
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_callbacks_raises_when_worker_unavailable_by_default(tmp_path):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    async def blocked_callback(_event):
+        return None
+
+    await store.register_builtin_callback("blocked")
+    await store.register_expiry_callback("blocked", blocked_callback)
+    await store.set("default", "k1", "v1", retention=1, on_expire="blocked")
+    await store.cleanup_expired(now=time.time() + 120)
+
+    with pytest.raises(TimeoutError, match="worker_unavailable"):
+        await store.wait_for_callbacks(timeout=1)
+
+    StoreService._release_file_lock(callback_lock)
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_is_bounded_when_callback_worker_unavailable(tmp_path):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    async def blocked_callback(_event):
+        return None
+
+    await store.register_builtin_callback("blocked")
+    await store.register_expiry_callback("blocked", blocked_callback)
+    await store.set("default", "k1", "v1", retention=1, on_expire="blocked")
+    await store.cleanup_expired(now=time.time() + 120)
+
+    started = time.monotonic()
+    await store.shutdown()
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.5
+
+    StoreService._release_file_lock(callback_lock)
+
+
+@pytest.mark.asyncio
+async def test_callback_execution_does_not_hold_global_write_lock(tmp_path):
+    store = _make_store(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    async def slow_callback(_event):
+        entered.set()
+        await asyncio.to_thread(release.wait)
+
+    await store.register_builtin_callback("slow")
+    await store.register_expiry_callback("slow", slow_callback)
+    await store.set("default", "k1", "v1", retention=1, on_expire="slow")
+    await store.cleanup_expired(now=time.time() + 120)
+
+    await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=2)
+    await asyncio.wait_for(
+        store.set("default", "normal", "ok", retention=10),
+        timeout=0.2,
+    )
+
+    release.set()
+    await store.wait_for_callbacks(timeout=2)
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_store_expiry_callback_survives_restart(tmp_path):
     db_path = tmp_path / "store_lmdb"
     callback_lock = StoreService._try_acquire_file_lock(
@@ -226,7 +368,7 @@ async def test_store_expiry_callback_survives_restart(tmp_path):
     )
     assert callback_lock is not None
 
-    blocked_callback = asyncio.Event()
+    blocked_callback = threading.Event()
 
     async def on_expire_blocked(_event):
         blocked_callback.set()
@@ -244,7 +386,7 @@ async def test_store_expiry_callback_survives_restart(tmp_path):
     assert not blocked_callback.is_set()
 
     restored_events: list[tuple[str, str, object | None, int]] = []
-    callback_restored = asyncio.Event()
+    callback_restored = threading.Event()
 
     async def on_expire_restored(event):
         restored_events.append((event.namespace, event.key, event.value, event.expire_ts))
@@ -254,7 +396,7 @@ async def test_store_expiry_callback_survives_restart(tmp_path):
     await store2.register_builtin_callback("on_expire")
     await store2.register_expiry_callback("on_expire", on_expire_restored)
     await asyncio.wait_for(store2.wait_for_callbacks(), timeout=2)
-    await asyncio.wait_for(callback_restored.wait(), timeout=2)
+    await asyncio.wait_for(asyncio.to_thread(callback_restored.wait), timeout=2)
 
     assert restored_events
     ns, key, value, expire_ts = restored_events[0]
@@ -264,6 +406,32 @@ async def test_store_expiry_callback_survives_restart(tmp_path):
     assert expire_ts > 0
 
     await store2.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_store_expiry_callback_runs_on_dedicated_thread(tmp_path):
+    store = _make_store(tmp_path)
+    callback_done = threading.Event()
+    callback_thread_id: int | None = None
+    main_thread_id = threading.get_ident()
+
+    async def on_expire(_event):
+        nonlocal callback_thread_id
+        callback_thread_id = threading.get_ident()
+        callback_done.set()
+
+    await store.register_builtin_callback("thread_check")
+    await store.register_expiry_callback("thread_check", on_expire)
+    await store.set("default", "k1", "v1", retention=1, on_expire="thread_check")
+
+    await store.cleanup_expired(now=time.time() + 120)
+    await asyncio.wait_for(asyncio.to_thread(callback_done.wait), timeout=2)
+    await store.wait_for_callbacks(timeout=2)
+
+    assert callback_thread_id is not None
+    assert callback_thread_id != main_thread_id
+
+    await store.shutdown()
 
 
 @pytest.mark.asyncio
@@ -425,6 +593,90 @@ async def test_namespace_registration_failure_does_not_pollute_memory_state(
     monkeypatch.setattr(store, "_register_namespace_in_meta", original_register)
     await store.set("ns_fail", "k", "v", retention=10)
     assert await store.get("ns_fail", "k") == "v"
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_keeps_metadata_for_retry(tmp_path, monkeypatch):
+    store = _make_store(tmp_path)
+    await store.set("default", "k1", "v1", retention=1)
+
+    original_write_data = store._write_data_txn_with_resize
+    failed_once = False
+
+    def fail_once(fn, estimated_write_bytes: int) -> None:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("simulated data txn failure")
+        original_write_data(fn, estimated_write_bytes)
+
+    monkeypatch.setattr(store, "_write_data_txn_with_resize", fail_once)
+
+    with pytest.raises(RuntimeError, match="simulated data txn failure"):
+        await store.cleanup_expired(now=time.time() + 120)
+
+    monkeypatch.setattr(store, "_write_data_txn_with_resize", original_write_data)
+    await store.cleanup_expired(now=time.time() + 240)
+
+    assert await store.get("default", "k1") is None
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_namespace_lock_rejects_inherited_stale_lease_after_parent_exit(tmp_path):
+    store = _make_store(tmp_path)
+    await store.set("default", "seed", "ok", retention=10)
+
+    release_child = asyncio.Event()
+
+    async def leaked_child() -> None:
+        await release_child.wait()
+        with pytest.raises(RuntimeError, match="lease is no longer active"):
+            await store.set("default", "child", "v", retention=10)
+
+    async with store.create_namespace_lock("default"):
+        child = asyncio.create_task(leaked_child())
+
+    release_child.set()
+    await child
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_namespace_lock_create_task_waits_children_before_release(tmp_path):
+    store = _make_store(tmp_path)
+    await store.set("default", "seed", "ok", retention=10)
+
+    marks: dict[str, float] = {}
+    contender_acquired = asyncio.Event()
+
+    async def child_writer() -> None:
+        await asyncio.sleep(0.05)
+        await store.set("default", "child", "v", retention=10)
+        marks["child_done"] = time.monotonic()
+
+    async def contender() -> None:
+        await asyncio.sleep(0.01)
+        async with store.create_namespace_lock("default"):
+            marks["contender_acquired"] = time.monotonic()
+            contender_acquired.set()
+
+    contender_task = asyncio.create_task(contender())
+    async with store.create_namespace_lock("default") as lease:
+        lease.create_task(child_writer())
+        await asyncio.sleep(0.02)
+        assert not contender_acquired.is_set()
+
+    await contender_task
+    assert "child_done" in marks
+    assert "contender_acquired" in marks
+    assert marks["child_done"] <= marks["contender_acquired"]
+
+    async with store.create_namespace_lock("default"):
+        assert await store.get("default", "child") == "v"
 
     await store.shutdown()
 
