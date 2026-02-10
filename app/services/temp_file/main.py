@@ -195,7 +195,7 @@ class TempFileService(BaseService):
         await self._store.register_builtin_callback(self._callback_name)
         await self._store.register_expiry_callback(self._callback_name, self._on_expire)
         await self._adopt_existing_files()
-        if self._size_recalc_task is None:
+        if self._max_total_size_bytes is not None and self._size_recalc_task is None:
             self._size_recalc_task = asyncio.create_task(
                 self._total_size_recalc_loop(
                     self._cleanup_stop,

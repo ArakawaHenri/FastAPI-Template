@@ -482,6 +482,19 @@ async def test_recalculate_total_size_now_repairs_counter(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_total_size_recalc_loop_starts_only_with_total_limit(tmp_path: Path):
+    service1, store1 = await _make_service(tmp_path / "no_limit", max_total_size_mb=0)
+    assert service1._size_recalc_task is None
+    await service1.shutdown()
+    await store1.shutdown()
+
+    service2, store2 = await _make_service(tmp_path / "with_limit", max_total_size_mb=1)
+    assert service2._size_recalc_task is not None
+    await service2.shutdown()
+    await store2.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_cleanup_reclaims_total_size_counter(tmp_path: Path):
     service, store = await _make_service(tmp_path, retention_days=1, max_total_size_mb=1)
     base_dir = Path(service._config.base_dir)

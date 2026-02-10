@@ -55,8 +55,8 @@ uv run python main.py --host 0.0.0.0 --port 8000
 - `RELOAD`：开发用热重载开关。
 - `CORS_ORIGINS`：允许来源列表，JSON 数组格式（示例：`["https://example.com"]`）。
 - `LOG_DIR`：日志目录（不存在会自动创建）。
-- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_WORKER_THREADS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`：临时文件存储、固定线程池大小、保留时间及大小上限（`TempFileService`）。
-- `STORE_LMDB__*`：LMDB 存储配置（含回调执行固定线程池大小 `STORE_LMDB__WORKER_THREADS`，见下方说明）。
+- `TMP_DIR`, `TMP_RETENTION_DAYS`, `TMP_WORKER_THREADS`, `TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`, `TMP_TOTAL_SIZE_RECALC_SECONDS`：临时文件存储、固定线程池大小、保留时间、大小上限与总量重算周期（`TempFileService`）。
+- `STORE_LMDB__*`：LMDB 存储配置（含回调执行固定线程池大小 `STORE_LMDB__CALLBACK_WORKER_THREADS`，见下方说明）。
 - `SEMAPHORES__<name>`：信号量配置（使用 `env_nested_delimiter="__"`）。
 - `DATABASE__<name>__*`：数据库嵌套配置。示例默认使用 MySQL + `aiomysql`。
 
@@ -77,9 +77,10 @@ uv run python main.py --host 0.0.0.0 --port 8000
 | `TMP_WORKER_THREADS` | int | `4` | TempFileService 固定线程池大小 |
 | `TMP_MAX_FILE_SIZE_MB` | int | `1024` | 单个临时文件大小上限（`0` 表示不限） |
 | `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | 临时目录总大小上限（`0` 表示不限） |
+| `TMP_TOTAL_SIZE_RECALC_SECONDS` | int | `3600` | 总大小重算周期（秒，`>= 60`，仅在启用总容量上限时生效） |
 | `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | SQLAlchemy 异步连接串 |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB 存储路径 |
-| `STORE_LMDB__WORKER_THREADS` | int | `4` | Store 过期回调执行固定线程池大小 |
+| `STORE_LMDB__CALLBACK_WORKER_THREADS` | int | `4` | Store 过期回调执行固定线程池大小 |
 | `STORE_LMDB__MAX_DBS` | int | `256` | 必须 `>= 0`（`0` 表示关闭用户 namespace 配额） |
 | `SEMAPHORES__db` | int | `5` | 嵌套配置示例 |
 | `SEMAPHORES__example` | int | `10` | `/api/v1/example/` 示例路由使用 |
@@ -137,6 +138,7 @@ main.py                       # granian 启动脚本
 - `TempFileService`（匿名注册，按 `TempFileService` 类型解析）在 `TMP_DIR` 下管理临时文件。
 - `TMP_MAX_FILE_SIZE_MB` 会限制 `save/read` 的单文件最大大小（`0` 表示不限）。
 - `TMP_MAX_TOTAL_SIZE_MB` 会限制临时目录写入总容量（`0` 表示不限）。
+- `TMP_TOTAL_SIZE_RECALC_SECONDS` 控制总大小周期重算（仅在 `TMP_MAX_TOTAL_SIZE_MB > 0` 时启用）。
 - `save(name, content)` 保存文本或二进制；重名自动写为 `filename.1.ext`、`filename.2.ext`。
 - 以 `.` 开头的文件名会被转义（如 `.env` → `%2Eenv`），避免隐藏文件。
 - `read(name)`：文本返回 `str`，二进制返回 `bytes`。
