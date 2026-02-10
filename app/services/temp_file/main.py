@@ -35,6 +35,7 @@ class TempFileConfig:
     base_dir: str
     retention_days: int
     cleanup_interval_seconds: int = 60
+    total_size_recalc_seconds: int = 60 * 60
     worker_threads: int = 4
     max_file_size_mb: int = 0
     max_total_size_mb: int = 0
@@ -63,6 +64,7 @@ class TempFileService(BaseService):
             base_dir: str,
             retention_days: int,
             cleanup_interval_seconds: int = 60,
+            total_size_recalc_seconds: int = 60 * 60,
             worker_threads: int = 4,
             max_file_size_mb: int = 0,
             max_total_size_mb: int = 0,
@@ -74,6 +76,7 @@ class TempFileService(BaseService):
                     base_dir=base_dir,
                     retention_days=retention_days,
                     cleanup_interval_seconds=cleanup_interval_seconds,
+                    total_size_recalc_seconds=total_size_recalc_seconds,
                     worker_threads=worker_threads,
                     max_file_size_mb=max_file_size_mb,
                     max_total_size_mb=max_total_size_mb,
@@ -111,6 +114,7 @@ class TempFileService(BaseService):
         if config.max_total_size_mb > 0:
             self._max_total_size_bytes = config.max_total_size_mb * 1024 * 1024
         self._cleanup_interval_seconds = config.cleanup_interval_seconds
+        self._total_size_recalc_seconds = config.total_size_recalc_seconds
         self._namespace = config.namespace
         self._callback_name = self._build_callback_name(self._namespace)
         self._executor = ThreadPoolExecutor(
@@ -124,6 +128,7 @@ class TempFileService(BaseService):
         self._total_size_bytes: int = 0
         self._cleanup_stop = asyncio.Event()
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._size_recalc_task: Optional[asyncio.Task] = None
         self._cleanup_lock_handle: Optional[TextIO] = None
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._runtime_thread: threading.Thread | None = None
@@ -190,6 +195,13 @@ class TempFileService(BaseService):
         await self._store.register_builtin_callback(self._callback_name)
         await self._store.register_expiry_callback(self._callback_name, self._on_expire)
         await self._adopt_existing_files()
+        if self._size_recalc_task is None:
+            self._size_recalc_task = asyncio.create_task(
+                self._total_size_recalc_loop(
+                    self._cleanup_stop,
+                    interval_seconds=self._total_size_recalc_seconds,
+                )
+            )
 
     async def start_cleanup(self) -> None:
         if not self._is_runtime_thread():
@@ -226,6 +238,9 @@ class TempFileService(BaseService):
         if self._closed:
             return
         self._cleanup_stop.set()
+        if self._size_recalc_task is not None:
+            await self._size_recalc_task
+            self._size_recalc_task = None
         if self._cleanup_task is not None:
             await self._cleanup_task
         await self._run_in_executor(self._release_file_lock, self._cleanup_lock_handle)
@@ -327,40 +342,32 @@ class TempFileService(BaseService):
                 base_name,
                 staging_name,
             )
-        try:
-            await self._set_metadata(
-                base_name,
-                is_text,
-                self._retention_minutes,
-                revision=revision,
-            )
-        except Exception:
-            async with self._write_guard:
-                # Rollback logic: staging is gone, backup is back to base
-                # We need to know the size of staging that was at 'base' to subtract it.
-                # Actually _rollback... handles the file swap.
-                # It's easier to just re-scan or be very precise.
+            try:
+                await self._set_metadata(
+                    base_name,
+                    is_text,
+                    self._retention_minutes,
+                    revision=revision,
+                )
+            except Exception:
                 # Rollback deletes the failed 'base' (which was 'staging') and restores backup.
-                path = self._base_dir / base_name
-                failed_staging_size = 0
-                try:
-                    failed_staging_size = path.lstat().st_size
-                except Exception:
-                    pass
-
-                await self._run_in_executor(
+                # The rollback function returns the actual size deleted.
+                deleted_size = await self._run_in_executor(
                     self._rollback_overwrite_after_metadata_failure,
                     base_name,
                     backup_name,
                 )
-                self._total_size_bytes -= failed_staging_size
-            logger.exception(
-                "[TMP] Failed to write metadata for temp file", name=base_name)
-            raise
-        else:
-            # Discard backup
-            deleted_size = await self._run_in_executor(self._discard_backup_file, backup_name)
-            self._total_size_bytes -= deleted_size
+                self._total_size_bytes -= deleted_size
+                logger.exception(
+                    "[TMP] Failed to write metadata for temp file", name=base_name
+                )
+                raise
+            else:
+                # Discard backup
+                deleted_size = await self._run_in_executor(
+                    self._discard_backup_file, backup_name
+                )
+                self._total_size_bytes -= deleted_size
 
         return base_name
 
@@ -730,13 +737,18 @@ class TempFileService(BaseService):
         self,
         base_name: str,
         backup_name: str | None,
-    ) -> None:
+    ) -> int:
+        """Rollback failed overwrite by deleting file and restoring backup.
+
+        Returns:
+            The size of the file that was deleted (0 if no file was deleted).
+        """
         path = self._base_dir / base_name
         if backup_name is None:
-            self._delete_file(base_name)
-            return
+            return self._delete_file(base_name)
 
         backup_path = self._base_dir / backup_name
+        deleted_size = 0
         try:
             st = path.lstat()
         except FileNotFoundError:
@@ -744,9 +756,11 @@ class TempFileService(BaseService):
         if st is not None:
             if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
                 raise ValueError(f"Path is not a regular file: {base_name}")
+            deleted_size = st.st_size
             path.unlink()
         os.replace(backup_path, path)
         self._tighten_file_permissions(path)
+        return deleted_size
 
     def _discard_backup_file(self, backup_name: str | None) -> int:
         if not backup_name:
@@ -894,6 +908,8 @@ class TempFileService(BaseService):
             raise ValueError("retention_days must be >= 1")
         if config.cleanup_interval_seconds < 1:
             raise ValueError("cleanup_interval_seconds must be >= 1")
+        if config.total_size_recalc_seconds < 60:
+            raise ValueError("total_size_recalc_seconds must be >= 60")
         if config.worker_threads < 1:
             raise ValueError("worker_threads must be >= 1")
         if config.max_file_size_mb < 0:
@@ -1176,3 +1192,31 @@ class TempFileService(BaseService):
         interval_seconds: int = 60,
     ) -> None:
         await _runtime.cleanup_loop(name, cleanup_fn, stop_event, interval_seconds)
+
+    async def _total_size_recalc_loop(
+        self,
+        stop_event: asyncio.Event,
+        interval_seconds: int = 60 * 60,
+    ) -> None:
+        logger.debug(
+            "[TMP] Total size recalculation loop started",
+            interval_seconds=interval_seconds,
+        )
+        try:
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    await self._recalculate_total_size_now()
+                except Exception:
+                    logger.exception("[TMP] Total size recalculation failed")
+        finally:
+            logger.debug("[TMP] Total size recalculation loop stopped")
+
+    async def _recalculate_total_size_now(self) -> None:
+        async with self._write_guard:
+            entries = await self._run_in_executor(self._scan_files)
+            self._total_size_bytes = sum(size for _, _, size in entries)

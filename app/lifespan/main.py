@@ -121,6 +121,7 @@ async def lifespan(app: FastAPI):
             settings.tmp_dir,
             settings.tmp_retention_days,
             settings.tmp_cleanup_interval_seconds,
+            settings.tmp_total_size_recalc_seconds,
             settings.tmp_worker_threads,
             settings.tmp_max_file_size_mb,
             settings.tmp_max_total_size_mb,

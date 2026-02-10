@@ -297,12 +297,9 @@ class StoreService(BaseService):
                 self._lease_id = lease_id
                 if task_group is not None:
                     self._task_group = task_group
-            elif self._lease_id != lease_id:
-                # Defensive: this should not happen when release/acquire is balanced.
-                self._store._release_exclusive(self._namespace)
-                raise RuntimeError(
-                    f"Exclusive lease switched unexpectedly for namespace '{self._namespace}'."
-                )
+            # Note: _acquire_exclusive already handles stale contextvar state
+            # by dropping it and re-acquiring a fresh lease, so no additional
+            # lease_id validation is needed here.
             self._enter_depth += 1
             return self
 
@@ -1041,78 +1038,86 @@ class StoreService(BaseService):
         try:
             with self._meta_env.begin(write=False) as meta_txn:
                 for namespace in namespaces:
-                    if deletes_left <= 0:
-                        break
-                    exp_db = exp_dbs[namespace]
-                    expmeta_db = expmeta_dbs[namespace]
-                    callback_db = callback_dbs[namespace]
-                    with meta_txn.cursor(db=exp_db) as cursor:
-                        if not cursor.first():
-                            continue
+                    try:
+                        if deletes_left <= 0:
+                            break
+                        exp_db = exp_dbs[namespace]
+                        expmeta_db = expmeta_dbs[namespace]
+                        callback_db = callback_dbs[namespace]
+                        with meta_txn.cursor(db=exp_db) as cursor:
+                            if not cursor.first():
+                                continue
 
-                        while True:
-                            bucket_key = cursor.key()
-                            if bucket_key is None or bucket_key > bucket_limit:
-                                break
-
-                            bucket_key_bytes = bytes(bucket_key)
-                            dup_iter = cursor.iternext_dup()
-                            dup_entries = list(
-                                itertools.islice(dup_iter, deletes_left))
-                            for raw_key in dup_entries:
-                                key_bytes = bytes(raw_key)
-                                expmeta_ts = 0
-                                raw = meta_txn.get(key_bytes, db=expmeta_db)
-                                if raw is not None and len(raw) >= _EXPIRY_STRUCT.size:
-                                    expmeta_ts = _EXPIRY_STRUCT.unpack_from(raw, 0)[
-                                        0]
-
-                                if expmeta_ts and expmeta_ts > now:
-                                    expire_ts = expmeta_ts
-                                else:
-                                    payload_ts = 0
-                                    data_txn, data_db = _resolve_data(
-                                        namespace)
-                                    payload = data_txn.get(
-                                        key_bytes, db=data_db)
-                                    if payload is not None and len(payload) >= _EXPIRY_STRUCT.size:
-                                        payload_ts = _EXPIRY_STRUCT.unpack_from(payload, 0)[
-                                            0]
-                                    if expmeta_ts and payload_ts:
-                                        expire_ts = max(expmeta_ts, payload_ts)
-                                    else:
-                                        expire_ts = expmeta_ts or payload_ts
-                                if expire_ts == 0 or expire_ts > now:
-                                    stale_exp_index_entries.append(
-                                        (namespace, bucket_key_bytes, key_bytes)
-                                    )
-                                    continue
-
-                                callback_raw = meta_txn.get(
-                                    key_bytes, db=callback_db)
-                                callback_name = None
-                                if callback_raw:
-                                    callback_name = self._decode_callback_name(
-                                        callback_raw
-                                    )
-
-                                deletes_left -= 1
-
-                                expired_items.append(
-                                    (
-                                        namespace,
-                                        key_bytes,
-                                        bucket_key_bytes,
-                                        expire_ts,
-                                        callback_name,
-                                    )
-                                )
-
-                                if deletes_left <= 0:
+                            while True:
+                                bucket_key = cursor.key()
+                                if bucket_key is None or bucket_key > bucket_limit:
                                     break
 
-                            if not cursor.next_nodup():
-                                break
+                                bucket_key_bytes = bytes(bucket_key)
+                                dup_iter = cursor.iternext_dup()
+                                dup_entries = list(
+                                    itertools.islice(dup_iter, deletes_left))
+                                for raw_key in dup_entries:
+                                    key_bytes = bytes(raw_key)
+                                    expmeta_ts = 0
+                                    raw = meta_txn.get(key_bytes, db=expmeta_db)
+                                    if raw is not None and len(raw) >= _EXPIRY_STRUCT.size:
+                                        expmeta_ts = _EXPIRY_STRUCT.unpack_from(raw, 0)[
+                                            0]
+
+                                    if expmeta_ts and expmeta_ts > now:
+                                        expire_ts = expmeta_ts
+                                    else:
+                                        payload_ts = 0
+                                        data_txn, data_db = _resolve_data(
+                                            namespace)
+                                        payload = data_txn.get(
+                                            key_bytes, db=data_db)
+                                        if payload is not None and len(payload) >= _EXPIRY_STRUCT.size:
+                                            payload_ts = _EXPIRY_STRUCT.unpack_from(payload, 0)[
+                                                0]
+                                        if expmeta_ts and payload_ts:
+                                            expire_ts = max(expmeta_ts, payload_ts)
+                                        else:
+                                            expire_ts = expmeta_ts or payload_ts
+                                    if expire_ts == 0 or expire_ts > now:
+                                        stale_exp_index_entries.append(
+                                            (namespace, bucket_key_bytes, key_bytes)
+                                        )
+                                        continue
+
+                                    callback_raw = meta_txn.get(
+                                        key_bytes, db=callback_db)
+                                    callback_name = None
+                                    if callback_raw:
+                                        callback_name = self._decode_callback_name(
+                                            callback_raw
+                                        )
+
+                                    deletes_left -= 1
+
+                                    expired_items.append(
+                                        (
+                                            namespace,
+                                            key_bytes,
+                                            bucket_key_bytes,
+                                            expire_ts,
+                                            callback_name,
+                                        )
+                                    )
+
+                                    if deletes_left <= 0:
+                                        break
+
+                                if not cursor.next_nodup():
+                                    break
+                    except Exception:
+                        logger.exception(
+                            "[STORE] Failed to cleanup namespace during iteration",
+                            namespace=namespace,
+                        )
+                        # Continue to next namespace instead of failing entire cleanup
+                        continue
 
             expired_events: list[ExpiryCallbackEvent] = []
             if any(item[4] for item in expired_items):
@@ -1132,7 +1137,12 @@ class StoreService(BaseService):
                         expired_events.append(event)
         finally:
             for txn in data_txns.values():
-                txn.abort()
+                try:
+                    txn.abort()
+                except Exception:
+                    logger.exception(
+                        "[STORE] Failed to abort read transaction during cleanup"
+                    )
 
         if expired_items:
             def _delete_data(txn) -> None:

@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     tmp_dir: str = "./tmp"
     tmp_retention_days: int = 3
     tmp_cleanup_interval_seconds: int = 60
+    tmp_total_size_recalc_seconds: int = 3600
     # Size of TempFileService fixed thread pool.
     tmp_worker_threads: int = Field(default=4, ge=1)
     tmp_max_file_size_mb: int = 1024

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 
@@ -282,6 +283,68 @@ async def test_overwrite_symlink_replaces_with_regular_file(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_overwrite_directory_symlink_replaces_with_regular_file(tmp_path: Path):
+    service, store = await _make_service(tmp_path)
+    target_dir = tmp_path / "outside_dir"
+    target_dir.mkdir()
+    link = Path(service._config.base_dir) / "swap_dir.txt"
+    try:
+        os.symlink(target_dir, link)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink not supported on this platform")
+
+    await service.save_overwrite("swap_dir.txt", "inside")
+    path = Path(service._config.base_dir) / "swap_dir.txt"
+    assert not path.is_symlink()
+    assert await service.read("swap_dir.txt") == "inside"
+    assert target_dir.exists() and target_dir.is_dir()
+
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_save_overwrite_same_name_concurrent_keeps_single_target_file(
+    tmp_path: Path,
+):
+    service, store = await _make_service(tmp_path)
+
+    first = threading.Event()
+    proceed = threading.Event()
+    original_write_staging = service._write_staging_file
+
+    def delayed_write_staging(staging_name: str, data: bytes, now: float) -> None:
+        if not first.is_set():
+            first.set()
+            proceed.wait(timeout=2)
+        original_write_staging(staging_name, data, now)
+
+    service._write_staging_file = delayed_write_staging  # type: ignore[method-assign]
+
+    async def writer(payload: str) -> str:
+        return await service.save_overwrite("race.txt", payload)
+
+    t1 = asyncio.create_task(writer("one"))
+    await asyncio.wait_for(asyncio.to_thread(first.wait, 2), timeout=3)
+    t2 = asyncio.create_task(writer("two"))
+    proceed.set()
+    results = await asyncio.gather(t1, t2)
+
+    assert results == ["race.txt", "race.txt"]
+    base_dir = Path(service._config.base_dir)
+    user_files = sorted(
+        p.name
+        for p in base_dir.iterdir()
+        if not TempFileService._is_internal_artifact_name(p.name)
+    )
+    assert user_files == ["race.txt"]
+    assert await service.read("race.txt") in {"one", "two"}
+
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_save_overwrite_is_not_deleted_by_stale_expiry_callback(tmp_path: Path):
     service, store = await _make_service(tmp_path)
     callback_lock = StoreService._try_acquire_file_lock(
@@ -399,6 +462,21 @@ async def test_cleanup_untracked_files(tmp_path: Path):
     await service.cleanup_expired(now=time.time())
 
     assert not untracked.exists()
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recalculate_total_size_now_repairs_counter(tmp_path: Path):
+    service, store = await _make_service(tmp_path)
+    name = await service.save("size.bin", b"x" * 128)
+    file_size = (Path(service._config.base_dir) / name).lstat().st_size
+
+    # Simulate counter drift and ensure periodic recalculation API self-heals it.
+    service._total_size_bytes = 0
+    await service._recalculate_total_size_now()
+
+    assert service._get_total_size_bytes() == file_size
     await service.shutdown()
     await store.shutdown()
 
