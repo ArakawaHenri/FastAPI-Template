@@ -17,7 +17,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, ClassVar, Optional, TextIO
+from typing import Any, Awaitable, Callable, ClassVar, Optional
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
@@ -1784,11 +1784,11 @@ class StoreService(BaseService):
         return _release_slot
 
     @staticmethod
-    def _try_acquire_file_lock(path: Path) -> Optional[TextIO]:
+    def _try_acquire_file_lock(path: Path) -> Any | None:
         return _runtime.try_acquire_file_lock(path)
 
     @staticmethod
-    def _release_file_lock(handle: Optional[TextIO]) -> None:
+    def _release_file_lock(handle: Any | None) -> None:
         _runtime.release_file_lock(handle)
 
     @staticmethod

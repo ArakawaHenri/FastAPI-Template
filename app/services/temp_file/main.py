@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Optional, TextIO
+from typing import Any, Callable, ClassVar, Optional
 from urllib.parse import quote
 
 from loguru import logger
@@ -336,7 +336,7 @@ class TempFileService(BaseService):
         self._cleanup_stop = asyncio.Event()
         self._cleanup_task: Optional[asyncio.Task] = None
         self._size_recalc_task: Optional[asyncio.Task] = None
-        self._cleanup_lock_handle: Optional[TextIO] = None
+        self._cleanup_lock_handle: Any | None = None
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._runtime_thread: threading.Thread | None = None
         self._runtime_thread_id: int | None = None
@@ -1412,11 +1412,11 @@ class TempFileService(BaseService):
         self._runtime_thread = None
 
     @staticmethod
-    def _try_acquire_file_lock(path: Path) -> Optional[TextIO]:
+    def _try_acquire_file_lock(path: Path) -> Any | None:
         return _runtime.try_acquire_file_lock(path)
 
     @staticmethod
-    def _release_file_lock(handle: Optional[TextIO]) -> None:
+    def _release_file_lock(handle: Any | None) -> None:
         _runtime.release_file_lock(handle)
 
     async def _cleanup_loop(

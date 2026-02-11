@@ -12,7 +12,7 @@ dependencies = [
     "aiomysql>=0.3.2",
     "zlmdb>=23.1.1",
     "cbor2>=5.6.0",
-    "portalocker>=2.8.2",
+    "filelock>=3.16.0",
 ]
 
 [project.optional-dependencies]

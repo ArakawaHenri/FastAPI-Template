@@ -6,11 +6,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Optional
 
-import portalocker
+from filelock import FileLock, Timeout
 from loguru import logger
-from portalocker.exceptions import LockException
 
 _LOG_PREFIX = "STORE"
 
@@ -28,31 +27,27 @@ async def run_in_executor(
     return await loop.run_in_executor(executor, fn, *args)
 
 
-def try_acquire_file_lock(path: Path) -> Optional[TextIO]:
+def try_acquire_file_lock(path: Path) -> Optional[FileLock]:
     """Acquire non-blocking exclusive lock; returns None if lock is busy."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+")
-    tighten_file_permissions(path)
+    # Lock ownership may be released from a different thread than acquisition
+    # (e.g. callback worker teardown), so do not use thread-local context.
+    lock = FileLock(str(path), thread_local=False)
     try:
-        portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
-    except LockException:
-        handle.close()
+        lock.acquire(timeout=0)
+    except Timeout:
         return None
-    except Exception:
-        handle.close()
-        raise
-    return handle
+    tighten_file_permissions(path)
+    return lock
 
 
-def release_file_lock(handle: Optional[TextIO]) -> None:
+def release_file_lock(handle: Optional[FileLock]) -> None:
     if handle is None:
         return
     try:
-        portalocker.unlock(handle)
+        handle.release()
     except Exception:
         logger.exception(f"[{_LOG_PREFIX}] Failed to release file lock")
-    finally:
-        handle.close()
 
 
 def tighten_directory_permissions(path: Path) -> None:

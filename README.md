@@ -145,7 +145,7 @@ main.py                       # CLI runner for granian
 - `save(name, content)` stores text or binary; duplicate names become `filename.1.ext`, `filename.2.ext`, etc.
 - Leading dots are escaped (e.g., `.env` → `%2Eenv`) to avoid hidden files.
 - `read(name)` returns `str` if the original content was text, otherwise `bytes`.
-- Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).
+- Cleanup runs on a single worker via a file lock (cross-platform via `filelock`).
 
 ### LMDB store
 
@@ -153,7 +153,7 @@ main.py                       # CLI runner for granian
 - Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
 - `STORE_LMDB__MAX_DBS` controls user-namespace quota and must be `>= 0`; `0` disables the quota.
 - Namespaces marked as internal are excluded from user-namespace quota counting.
-- Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).
+- Cleanup runs on a single worker via a file lock (cross-platform via `filelock`).
 
 ### Lifespan
 

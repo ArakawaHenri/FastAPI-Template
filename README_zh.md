@@ -145,7 +145,7 @@ main.py                       # granian 启动脚本
 - `save(name, content)` 保存文本或二进制；重名自动写为 `filename.1.ext`、`filename.2.ext`。
 - 以 `.` 开头的文件名会被转义（如 `.env` → `%2Eenv`），避免隐藏文件。
 - `read(name)`：文本返回 `str`，二进制返回 `bytes`。
-- 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。
+- 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `filelock`）。
 
 ### LMDB 存储
 
@@ -153,7 +153,7 @@ main.py                       # granian 启动脚本
 - 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
 - `STORE_LMDB__MAX_DBS` 用于控制用户 namespace 配额，必须 `>= 0`；`0` 表示关闭配额限制。
 - 被标记为 internal 的 namespace 不计入用户 namespace 配额。
-- 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。
+- 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `filelock`）。
 
 ### Lifespan
 
