@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from loguru import logger
@@ -10,6 +11,12 @@ from loguru import logger
 # Context variable for request tracing across async calls
 request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default="-")
+
+_LOGGING_STATE_LOCK = threading.Lock()
+_LOGGING_STATE_COND = threading.Condition(_LOGGING_STATE_LOCK)
+_LOGGING_REFCOUNT = 0
+_LOGGING_SHUTTING_DOWN = False
+_LOGGING_CONFIG: tuple[str, bool] | None = None
 
 
 class InterceptHandler(logging.Handler):
@@ -30,11 +37,33 @@ class InterceptHandler(logging.Handler):
 
 
 def setup_logging(log_dir: Path, debug: bool):
+    global _LOGGING_REFCOUNT, _LOGGING_CONFIG
+
+    normalized_log_dir = str(Path(log_dir).expanduser().resolve())
+
+    with _LOGGING_STATE_COND:
+        while _LOGGING_SHUTTING_DOWN:
+            _LOGGING_STATE_COND.wait()
+
+        if _LOGGING_REFCOUNT > 0:
+            requested_config = (normalized_log_dir, debug)
+            if _LOGGING_CONFIG != requested_config:
+                logger.warning(
+                    "setup_logging called with different config while logging is already initialized; "
+                    "keeping existing config"
+                )
+            _LOGGING_REFCOUNT += 1
+            return
+
+        _LOGGING_REFCOUNT = 1
+        _LOGGING_CONFIG = (normalized_log_dir, debug)
+
     logger.remove()
 
     console_level = "DEBUG" if debug else "INFO"
 
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir_path = Path(normalized_log_dir)
+    log_dir_path.mkdir(parents=True, exist_ok=True)
 
     logger.add(
         sys.stderr,
@@ -48,7 +77,7 @@ def setup_logging(log_dir: Path, debug: bool):
         ),
     )
 
-    log_file_path = Path(log_dir) / "app_{time}.log"
+    log_file_path = log_dir_path / "app_{time}.log"
 
     def request_id_patcher(record):
         record["extra"]["request_id"] = request_id_ctx.get()
@@ -75,6 +104,27 @@ def setup_logging(log_dir: Path, debug: bool):
 
 
 async def shutdown_logging():
-    logger.debug("Flushing all log messages before shutdown...")
-    await logger.complete()
-    logger.remove()
+    global _LOGGING_REFCOUNT, _LOGGING_SHUTTING_DOWN, _LOGGING_CONFIG
+
+    with _LOGGING_STATE_COND:
+        while _LOGGING_SHUTTING_DOWN:
+            _LOGGING_STATE_COND.wait()
+
+        if _LOGGING_REFCOUNT == 0:
+            return
+
+        _LOGGING_REFCOUNT -= 1
+        if _LOGGING_REFCOUNT > 0:
+            return
+
+        _LOGGING_SHUTTING_DOWN = True
+
+    try:
+        logger.debug("Flushing all log messages before shutdown...")
+        await logger.complete()
+        logger.remove()
+    finally:
+        with _LOGGING_STATE_COND:
+            _LOGGING_SHUTTING_DOWN = False
+            _LOGGING_CONFIG = None
+            _LOGGING_STATE_COND.notify_all()

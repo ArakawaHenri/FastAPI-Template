@@ -107,6 +107,252 @@ def test_temp_file_callback_name_is_stable_for_same_namespace():
 
 
 @pytest.mark.asyncio
+async def test_temp_file_lifespan_ctor_reuses_shared_instance_and_capacity(tmp_path: Path):
+    store_path = str(tmp_path / "store_lmdb")
+    store1 = await StoreService.LifespanTasks.ctor(path=store_path, map_size_mb=16)
+    store2 = await StoreService.LifespanTasks.ctor(path=store_path, map_size_mb=16)
+    assert store1 is store2
+
+    service1 = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store1,
+    )
+    service2 = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store2,
+    )
+    assert service1 is service2
+
+    await service1.save("a.bin", b"x" * (800 * 1024))
+    with pytest.raises(ValueError, match="total size exceeds max"):
+        await service2.save("b.bin", b"x" * (400 * 1024))
+
+    await TempFileService.LifespanTasks.dtor(service1)
+    assert not service1._closed
+    await TempFileService.LifespanTasks.dtor(service2)
+    assert service1._closed
+
+    await StoreService.LifespanTasks.dtor(store1)
+    assert not store1._closed
+    await StoreService.LifespanTasks.dtor(store2)
+    assert store1._closed
+
+
+@pytest.mark.asyncio
+async def test_temp_file_lifespan_ctor_rejects_shared_config_mismatch(tmp_path: Path):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    service = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="config mismatch"):
+            await TempFileService.LifespanTasks.ctor(
+                base_dir=str(tmp_path / "tmp_files"),
+                retention_days=1,
+                cleanup_interval_seconds=60,
+                total_size_recalc_seconds=60,
+                worker_threads=2,
+                max_file_size_mb=0,
+                max_total_size_mb=2,
+                store_provider=lambda: store,
+            )
+    finally:
+        await TempFileService.LifespanTasks.dtor(service)
+        await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
+async def test_temp_file_lifespan_ctor_waits_for_shared_bootstrap(tmp_path: Path, monkeypatch):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    bootstrap_calls = 0
+    original_bootstrap = TempFileService._bootstrap
+
+    async def delayed_bootstrap(self: TempFileService) -> None:
+        nonlocal bootstrap_calls
+        if not self._is_runtime_thread():
+            bootstrap_calls += 1
+            started.set()
+            await release.wait()
+        await original_bootstrap(self)
+
+    monkeypatch.setattr(TempFileService, "_bootstrap", delayed_bootstrap)
+
+    task1 = asyncio.create_task(
+        TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    task2 = asyncio.create_task(
+        TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not task2.done()
+
+    release.set()
+    service1 = await task1
+    service2 = await task2
+    assert service1 is service2
+    assert bootstrap_calls == 1
+
+    await TempFileService.LifespanTasks.dtor(service1)
+    await TempFileService.LifespanTasks.dtor(service2)
+    await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
+async def test_temp_file_lifespan_ctor_recovers_after_bootstrap_failure(tmp_path: Path, monkeypatch):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    original_bootstrap = TempFileService._bootstrap
+
+    async def failing_bootstrap(self: TempFileService) -> None:
+        raise RuntimeError("bootstrap failed")
+
+    monkeypatch.setattr(TempFileService, "_bootstrap", failing_bootstrap)
+    with pytest.raises(RuntimeError, match="bootstrap failed"):
+        await TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+
+    monkeypatch.setattr(TempFileService, "_bootstrap", original_bootstrap)
+    service = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store,
+    )
+    await TempFileService.LifespanTasks.dtor(service)
+    await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
+async def test_temp_file_lifespan_ctor_does_not_deadlock_when_creator_is_cancelled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    original_bootstrap = TempFileService._bootstrap
+
+    async def blocking_bootstrap(self: TempFileService) -> None:
+        if not self._is_runtime_thread():
+            started.set()
+            await blocker.wait()
+        await original_bootstrap(self)
+
+    monkeypatch.setattr(TempFileService, "_bootstrap", blocking_bootstrap)
+
+    task1 = asyncio.create_task(
+        TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    task2 = asyncio.create_task(
+        TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+    )
+    await asyncio.sleep(0.05)
+    task1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task1
+    with pytest.raises(RuntimeError, match="failed to initialize"):
+        await asyncio.wait_for(task2, timeout=2)
+
+    monkeypatch.setattr(TempFileService, "_bootstrap", original_bootstrap)
+    service = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store,
+    )
+    await TempFileService.LifespanTasks.dtor(service)
+    await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
 async def test_save_and_read_text(tmp_path: Path):
     service, store = await _make_service(tmp_path)
     name = await service.save("note.txt", "hello")

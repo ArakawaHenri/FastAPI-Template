@@ -130,7 +130,10 @@ main.py                       # granian 启动脚本
 - `Inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
 - 类型注入时，`ServiceContainer` 会以工厂函数（`ctor`）的返回注解作为服务类型。
 - Session 示例：`session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`。
-- 不要跨事件循环或线程使用 `ServiceContainer`。
+- `ServiceContainer` 本身是单事件循环模型，不要跨事件循环或线程复用同一个容器。
+- Lifespan 会将“当前循环对应的容器”绑定到 `app.state.services_registry`（可适配 free-threaded worker）。
+- `Inject(...)` 只会从 `services_registry` 解析服务（不再回退到 `app.state.services`）。
+- `StoreService` 与 `TempFileService` 在 lifespan 中按进程共享（同路径/配置复用同一实例，并通过引用计数析构）。
 - 除特别设置外，单例默认不依赖瞬态服务。
 
 ### 临时文件
@@ -148,6 +151,7 @@ main.py                       # granian 启动脚本
 
 - `StoreService`（匿名注册，按 `StoreService` 类型解析）提供本地 LMDB KV + TTL。
 - 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
+- 回调元数据/任务数据库已切到 `v2` 命名空间，用于隔离旧 store 路径上历史 callback 元数据布局带来的崩溃风险。
 - `STORE_LMDB__MAX_DBS` 用于控制用户 namespace 配额，必须 `>= 0`；`0` 表示关闭配额限制。
 - 被标记为 internal 的 namespace 不计入用户 namespace 配额。
 - 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。
@@ -168,6 +172,7 @@ main.py                       # granian 启动脚本
 - 日志按天轮转，默认保留 7 天。
 - 避免记录敏感信息或请求体。
 - `DEBUG_MODE` 为 true 时开启更详细的 backtrace/diagnose。
+- 日志初始化/释放按进程共享并使用引用计数，避免 free-threaded worker 重复挂载 handler 或提前卸载日志系统。
 
 ### 中间件顺序
 
@@ -177,7 +182,9 @@ main.py                       # granian 启动脚本
 ### 并发模型
 
 - 支持多 worker，但需要满足约束条件。
-- 每个 worker 进程都有自己的 asyncio 事件循环，并在 lifespan 启动时创建自己的 `ServiceContainer`。
+- 进程 worker 模式下，每个 worker 进程会在 lifespan 启动时创建自己的 `ServiceContainer`。
+- free-threaded 模式下，如果多个 worker 共享同一个 app 对象，每个 worker 事件循环会在 `app.state.services_registry` 中注册自己的容器。
+- free-threaded 模式下，同一进程内的 worker 会复用同一个 `StoreService` / `TempFileService` 后端实例（按路径/配置划分）。
 - 不要在 worker 之间共享内存态服务实例；只共享外部状态（LMDB/文件/数据库）。
 - 后台清理循环和回调分发通过文件锁进行主 worker 选举，同一时刻最多一个 worker 执行对应循环。
 - 过期回调名称必须是确定性的，并且在所有 worker 中保持一致。
@@ -278,6 +285,7 @@ if "@" not in email:
 - `CORS_ORIGINS` 默认为空，需显式配置。
 - `DEBUG_MODE=true` 会回显请求体，生产必须禁用。
 - 在请求上下文之外解析瞬态服务时，析构器不会自动执行。
+- 不要在业务代码中直接读写 `app.state.services`；应通过 `Inject(...)` 解析服务，才能走到按事件循环路由的容器映射。
 - 临时文件容量超限（`TMP_MAX_FILE_SIZE_MB`、`TMP_MAX_TOTAL_SIZE_MB`）会记录 `error` 并向调用方抛出 `ValueError`，但不会导致服务退出。
 - 活跃 worker 中缺少对应过期回调名时会记录 `error`；请确保所有 worker 回调注册一致。
 - namespace 独占访问 API 已迁移为 `create_namespace_lock()`；旧的 `exclusive()` 不再使用。

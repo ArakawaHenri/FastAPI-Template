@@ -17,7 +17,7 @@ from concurrent.futures import (
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, TextIO
+from typing import Any, Awaitable, Callable, ClassVar, Optional, TextIO
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
@@ -106,6 +106,13 @@ class _CallbackRegistration:
     timeout_seconds: float
 
 
+@dataclass
+class _SharedStoreEntry:
+    instance: "StoreService"
+    signature: tuple[Any, ...]
+    ref_count: int = 1
+
+
 class StoreService(BaseService):
     """
     zLMDB-backed key-value store.
@@ -134,7 +141,7 @@ class StoreService(BaseService):
             cleanup_max_deletes: int = 1_000_000,
             worker_threads: int = 4,
         ) -> "StoreService":
-            return StoreService(
+            return await StoreService.acquire_shared(
                 StoreConfig(
                     path=path,
                     map_size_mb=map_size_mb,
@@ -156,6 +163,80 @@ class StoreService(BaseService):
 
         @staticmethod
         async def dtor(instance: "StoreService") -> None:
+            await StoreService.release_shared(instance)
+
+    _shared_instances: ClassVar[dict[str, _SharedStoreEntry]] = {}
+    _shared_instances_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @staticmethod
+    def _shared_store_key(path: str) -> str:
+        base_path = Path(path).expanduser()
+        data_path = base_path if base_path.suffix else (base_path / "data.mdb")
+        return str(data_path.resolve())
+
+    @staticmethod
+    def _shared_store_signature(config: StoreConfig) -> tuple[Any, ...]:
+        return (
+            config.map_size_mb,
+            config.map_size_growth_factor,
+            config.map_high_watermark,
+            config.max_dbs,
+            config.max_readers,
+            config.sync,
+            config.metasync,
+            config.writemap,
+            config.map_async,
+            config.max_key_bytes,
+            config.max_namespace_bytes,
+            config.max_value_bytes,
+            config.cleanup_max_deletes,
+            config.worker_threads,
+        )
+
+    @classmethod
+    async def acquire_shared(cls, config: StoreConfig) -> "StoreService":
+        key = cls._shared_store_key(config.path)
+        signature = cls._shared_store_signature(config)
+        with cls._shared_instances_lock:
+            entry = cls._shared_instances.get(key)
+            if entry is not None:
+                if entry.instance._closed:
+                    cls._shared_instances.pop(key, None)
+                else:
+                    if entry.signature != signature:
+                        raise RuntimeError(
+                            "StoreService config mismatch for shared path "
+                            f"'{key}'. Keep STORE_LMDB settings identical across workers."
+                        )
+                    entry.ref_count += 1
+                    return entry.instance
+
+            instance = cls(config)
+            instance._shared_instance_key = key
+            cls._shared_instances[key] = _SharedStoreEntry(
+                instance=instance,
+                signature=signature,
+                ref_count=1,
+            )
+            return instance
+
+    @classmethod
+    async def release_shared(cls, instance: "StoreService") -> None:
+        key = getattr(instance, "_shared_instance_key", None)
+        if key is None:
+            await instance.shutdown()
+            return
+
+        should_shutdown = False
+        with cls._shared_instances_lock:
+            entry = cls._shared_instances.get(key)
+            if entry is None or entry.instance is not instance:
+                return
+            entry.ref_count -= 1
+            if entry.ref_count <= 0:
+                cls._shared_instances.pop(key, None)
+                should_shutdown = True
+        if should_shutdown:
             await instance.shutdown()
 
     def __init__(self, config: StoreConfig) -> None:
@@ -267,6 +348,7 @@ class StoreService(BaseService):
             _RUNTIME_MAX_PENDING_CALLS
         )
         self._closed = False
+        self._shared_instance_key: str | None = self._shared_store_key(config.path)
         self._namespaces.update(self._list_namespaces())
         self._start_runtime_thread()
 

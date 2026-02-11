@@ -10,10 +10,10 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, TextIO
+from typing import Any, Callable, ClassVar, Optional, TextIO
 from urllib.parse import quote
 
 from loguru import logger
@@ -40,6 +40,15 @@ class TempFileConfig:
     max_file_size_mb: int = 0
     max_total_size_mb: int = 0
     namespace: str = "tmp_files"
+
+
+@dataclass
+class _SharedTempFileEntry:
+    instance: "TempFileService"
+    signature: tuple[Any, ...]
+    ref_count: int = 1
+    ready: threading.Event = field(default_factory=threading.Event)
+    init_error: BaseException | None = None
 
 
 class TempFileService(BaseService):
@@ -71,7 +80,7 @@ class TempFileService(BaseService):
             store_provider=None,
         ) -> "TempFileService":
             store = await TempFileService._resolve_store_provider(store_provider)
-            service = TempFileService(
+            return await TempFileService.acquire_shared(
                 TempFileConfig(
                     base_dir=base_dir,
                     retention_days=retention_days,
@@ -83,18 +92,122 @@ class TempFileService(BaseService):
                 ),
                 store,
             )
-            try:
-                await service._bootstrap()
-            except Exception:
-                try:
-                    await service.shutdown()
-                except Exception:
-                    logger.exception("[TMP] Failed to cleanup after bootstrap error")
-                raise
-            return service
 
         @staticmethod
         async def dtor(instance: "TempFileService") -> None:
+            await TempFileService.release_shared(instance)
+
+    _shared_instances: ClassVar[dict[str, _SharedTempFileEntry]] = {}
+    _shared_instances_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @staticmethod
+    def _shared_temp_key(config: TempFileConfig, store: StoreService) -> str:
+        store_key = getattr(store, "_shared_instance_key", None) or f"store:{id(store)}"
+        base_dir = str(Path(config.base_dir).expanduser().resolve())
+        return f"{store_key}|{base_dir}|{config.namespace}"
+
+    @staticmethod
+    def _shared_temp_signature(config: TempFileConfig) -> tuple[Any, ...]:
+        return (
+            config.retention_days,
+            config.cleanup_interval_seconds,
+            config.total_size_recalc_seconds,
+            config.worker_threads,
+            config.max_file_size_mb,
+            config.max_total_size_mb,
+        )
+
+    @staticmethod
+    async def _wait_shared_entry_ready(entry: _SharedTempFileEntry) -> None:
+        await asyncio.to_thread(entry.ready.wait)
+        if entry.init_error is not None:
+            raise RuntimeError(
+                "TempFileService shared instance failed to initialize"
+            ) from entry.init_error
+
+    @classmethod
+    async def acquire_shared(
+        cls,
+        config: TempFileConfig,
+        store: StoreService,
+    ) -> "TempFileService":
+        key = cls._shared_temp_key(config, store)
+        signature = cls._shared_temp_signature(config)
+        entry: _SharedTempFileEntry
+        created = False
+        with cls._shared_instances_lock:
+            entry = cls._shared_instances.get(key)
+            if entry is not None and entry.instance._closed:
+                cls._shared_instances.pop(key, None)
+                entry = None
+
+            if entry is not None:
+                if entry.signature != signature:
+                    raise RuntimeError(
+                        "TempFileService config mismatch for shared key "
+                        f"'{key}'. Keep TMP_* settings identical across workers."
+                    )
+                entry.ref_count += 1
+            else:
+                service = TempFileService(config, store)
+                service._shared_instance_key = key
+                entry = _SharedTempFileEntry(
+                    instance=service,
+                    signature=signature,
+                    ref_count=1,
+                )
+                cls._shared_instances[key] = entry
+                created = True
+
+        if not created:
+            try:
+                await cls._wait_shared_entry_ready(entry)
+            except Exception:
+                with cls._shared_instances_lock:
+                    current = cls._shared_instances.get(key)
+                    if current is entry:
+                        entry.ref_count -= 1
+                        if entry.ref_count <= 0:
+                            cls._shared_instances.pop(key, None)
+                raise
+            return entry.instance
+
+        service = entry.instance
+        try:
+            await service._bootstrap()
+        except BaseException as exc:
+            with cls._shared_instances_lock:
+                current = cls._shared_instances.get(key)
+                if current is entry:
+                    cls._shared_instances.pop(key, None)
+                entry.init_error = exc
+                entry.ready.set()
+            try:
+                await service.shutdown()
+            except Exception:
+                logger.exception("[TMP] Failed to cleanup after bootstrap error")
+            raise
+
+        entry.ready.set()
+        return service
+
+    @classmethod
+    async def release_shared(cls, instance: "TempFileService") -> None:
+        key = getattr(instance, "_shared_instance_key", None)
+        if key is None:
+            await instance.shutdown()
+            return
+
+        should_shutdown = False
+        with cls._shared_instances_lock:
+            entry = cls._shared_instances.get(key)
+            if entry is None or entry.instance is not instance:
+                return
+            entry.ref_count -= 1
+            if entry.ref_count <= 0:
+                cls._shared_instances.pop(key, None)
+                should_shutdown = True
+        if should_shutdown:
             await instance.shutdown()
 
     def __init__(self, config: TempFileConfig, store: StoreService) -> None:
@@ -139,6 +252,7 @@ class TempFileService(BaseService):
         )
         self._closed = False
         self._executor_shutdown = False
+        self._shared_instance_key: str | None = None
         self._start_runtime_thread()
 
         logger.debug("[TMP] TempFileService initialized")

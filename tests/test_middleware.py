@@ -15,6 +15,7 @@ from app.core.dependencies import (
     ServiceContainer,
     ServiceLifetime,
     TransientServiceFinalizerMiddleware,
+    get_or_create_services_registry,
 )
 from app.core.logger import request_id_ctx
 from app.core.settings import settings
@@ -131,6 +132,8 @@ class TestTransientServiceFinalizerMiddleware:
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             services = ServiceContainer()
+            registry = get_or_create_services_registry(app.state)
+            registry.register_current(services)
 
             async def factory():
                 try:
@@ -139,11 +142,11 @@ class TestTransientServiceFinalizerMiddleware:
                     call_order.append("finalizer")
 
             await services.register("transient", ServiceLifetime.TRANSIENT, factory, None)
-            app.state.services = services
             try:
                 yield
             finally:
                 await services.destruct_all_singletons()
+                registry.unregister_current(expected=services)
 
         app = FastAPI(lifespan=lifespan)
         app.add_middleware(TransientServiceFinalizerMiddleware)

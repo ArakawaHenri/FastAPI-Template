@@ -7,7 +7,7 @@ dependencies = [
     "fastapi>=0.123.5,<1.0.0",
     "loguru>=0.7.3",
     "pydantic-settings>=2.12.0",
-    "granian[reload]>=2.5.0",
+    "granian[pname, reload, uvloop, winloop]>=2.5.0,<3.0.0",
     "sqlalchemy[asyncio]>=2.0.0",
     "aiomysql>=0.3.2",
     "zlmdb>=23.1.1",
@@ -51,8 +51,13 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"] # Allow unused imports in __init__.py
-"app/core/dependencies.py" = ["B904"] # Preserve current explicit exception behavior in DI internals
-"app/services/base.py" = ["F821", "B027"] # Allow forward refs and default no-op dtor in base class
+"app/core/dependencies.py" = [
+    "B904",
+] # Preserve current explicit exception behavior in DI internals
+"app/services/base.py" = [
+    "F821",
+    "B027",
+] # Allow forward refs and default no-op dtor in base class
 "app/services/*/main.py" = [
     "F821",
 ] # Allow forward references in service implementations

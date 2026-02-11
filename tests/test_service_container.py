@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import AsyncIterator
 
 import pytest
@@ -9,7 +10,10 @@ from starlette.requests import Request
 from app.core.dependencies import (
     REQUEST_FAILED_STATE_KEY,
     ServiceContainer,
+    ServiceContainerRegistry,
     ServiceLifetime,
+    get_or_create_services_registry,
+    resolve_service_container,
 )
 
 
@@ -368,3 +372,38 @@ async def test_generator_transient_finalizer_rejects_iterator_style_factory():
             await finalizer()
 
     assert marks == ["finally"]
+
+
+@pytest.mark.asyncio
+async def test_service_container_registry_register_get_unregister():
+    registry = ServiceContainerRegistry()
+    container = ServiceContainer()
+
+    registry.register_current(container)
+    assert registry.get_current() is container
+    assert registry.unregister_current(expected=container) is container
+    assert registry.get_current() is None
+
+
+@pytest.mark.asyncio
+async def test_service_container_registry_rejects_different_container_on_same_loop():
+    registry = ServiceContainerRegistry()
+    container_a = ServiceContainer()
+    container_b = ServiceContainer()
+
+    registry.register_current(container_a)
+    with pytest.raises(RuntimeError, match="already registered"):
+        registry.register_current(container_b)
+    assert registry.unregister_current(expected=container_a) is container_a
+
+
+@pytest.mark.asyncio
+async def test_resolve_service_container_prefers_registry():
+    current = ServiceContainer()
+    app_state = SimpleNamespace()
+    registry = get_or_create_services_registry(app_state)
+    registry.register_current(current)
+    try:
+        assert resolve_service_container(app_state) is current
+    finally:
+        registry.unregister_current(expected=current)

@@ -40,6 +40,33 @@ def _make_store(
     )
 
 
+@pytest.mark.asyncio
+async def test_store_lifespan_ctor_reuses_shared_instance(tmp_path):
+    path = str(tmp_path / "store_lmdb")
+    store1 = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    store2 = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+
+    assert store1 is store2
+    assert not store1._closed
+
+    await StoreService.LifespanTasks.dtor(store1)
+    assert not store1._closed
+
+    await StoreService.LifespanTasks.dtor(store2)
+    assert store1._closed
+
+
+@pytest.mark.asyncio
+async def test_store_lifespan_ctor_rejects_shared_config_mismatch(tmp_path):
+    path = str(tmp_path / "store_lmdb")
+    store = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    try:
+        with pytest.raises(RuntimeError, match="config mismatch"):
+            await StoreService.LifespanTasks.ctor(path=path, map_size_mb=32)
+    finally:
+        await StoreService.LifespanTasks.dtor(store)
+
+
 def _worker_main(db_path: str, worker_id: int, start_event, error_queue):
     async def _run():
         store = StoreService(

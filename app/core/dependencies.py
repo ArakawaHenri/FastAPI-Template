@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import threading
 import types
 import uuid
 import weakref
@@ -1001,6 +1003,100 @@ class ServiceContainer:
         return lambda *a, **kw: self.aget_by_key(key, *a, **kw)
 
 
+class ServiceContainerRegistry:
+    """
+    Thread-safe registry mapping the current (process, thread, event loop)
+    execution context to a ServiceContainer.
+
+    This lets one FastAPI app object host multiple independent containers when
+    workers are implemented as threads (e.g., free-threaded runtimes).
+    """
+
+    def __init__(self) -> None:
+        self._containers: dict[tuple[int, int, int], ServiceContainer] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _current_key() -> tuple[int, int, int]:
+        loop = asyncio.get_running_loop()
+        return (os.getpid(), threading.get_ident(), id(loop))
+
+    def register_current(self, container: ServiceContainer) -> tuple[int, int, int]:
+        key = self._current_key()
+        with self._lock:
+            existing = self._containers.get(key)
+            if existing is not None and existing is not container:
+                raise RuntimeError(
+                    "A different ServiceContainer is already registered for the current event loop."
+                )
+            self._containers[key] = container
+        return key
+
+    def get_current(self) -> Optional[ServiceContainer]:
+        try:
+            key = self._current_key()
+        except RuntimeError:
+            return None
+        with self._lock:
+            return self._containers.get(key)
+
+    def unregister_current(
+        self,
+        *,
+        expected: ServiceContainer | None = None,
+    ) -> Optional[ServiceContainer]:
+        try:
+            key = self._current_key()
+        except RuntimeError:
+            return None
+        with self._lock:
+            existing = self._containers.get(key)
+            if existing is None:
+                return None
+            if expected is not None and existing is not expected:
+                logger.warning(
+                    "ServiceContainer registry mismatch on unregister; keeping current mapping."
+                )
+                return None
+            return self._containers.pop(key)
+
+
+_APP_STATE_REGISTRY_LOCK = threading.Lock()
+
+
+def get_or_create_services_registry(app_state: Any) -> ServiceContainerRegistry:
+    """
+    Return the app-level ServiceContainerRegistry, creating it if necessary.
+    """
+    registry = getattr(app_state, "services_registry", None)
+    if isinstance(registry, ServiceContainerRegistry):
+        return registry
+
+    with _APP_STATE_REGISTRY_LOCK:
+        registry = getattr(app_state, "services_registry", None)
+        if isinstance(registry, ServiceContainerRegistry):
+            return registry
+        registry = ServiceContainerRegistry()
+        app_state.services_registry = registry
+        return registry
+
+
+def resolve_service_container(app_state: Any) -> Optional[ServiceContainer]:
+    """
+    Resolve the ServiceContainer for the current execution context.
+
+    Resolution source:
+    - loop-local registry on app.state (free-threaded safe)
+    """
+    if app_state is None:
+        return None
+
+    registry = getattr(app_state, "services_registry", None)
+    if isinstance(registry, ServiceContainerRegistry):
+        return registry.get_current()
+    return None
+
+
 def Inject(
         target: Any = None,
         *args: Any,
@@ -1081,10 +1177,11 @@ def Inject(
     sig = inspect.Signature(params)
 
     async def _dependency_callable(request: Request, **resolved_deps: Any) -> Any:
-        services: Optional[ServiceContainer] = getattr(
-            request.app.state, "services", None)
+        services = resolve_service_container(getattr(request.app, "state", None))
         if services is None:
-            msg = "Service container not initialized on FastAPI app state."
+            msg = (
+                "Service container not initialized for the current event loop on FastAPI app state."
+            )
             logger.error(msg)
             raise RuntimeError(msg)
 
@@ -1140,7 +1237,7 @@ class TransientServiceFinalizerMiddleware:
 
     async def _run_finalizers(self, scope: Scope) -> None:
         app_state = getattr(scope.get("app"), "state", None)
-        services = getattr(app_state, "services", None) if app_state else None
+        services = resolve_service_container(app_state)
         if services is None:
             return
 

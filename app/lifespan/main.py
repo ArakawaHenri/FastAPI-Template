@@ -6,7 +6,11 @@ from pathlib import Path
 from fastapi import FastAPI
 from loguru import logger
 
-from app.core.dependencies import ServiceContainer, ServiceLifetime
+from app.core.dependencies import (
+    ServiceContainer,
+    ServiceLifetime,
+    get_or_create_services_registry,
+)
 from app.core.logger import setup_logging, shutdown_logging
 from app.core.settings import settings
 from app.services.async_generator_example import ExampleGeneratorServiceT
@@ -21,6 +25,7 @@ from app.services.transient_example import ExampleServiceT
 async def lifespan(app: FastAPI):
     logging_initialized = False
     services: ServiceContainer | None = None
+    services_registry = None
     try:
         setup_logging(Path(settings.log_dir), settings.debug_mode)
         logging_initialized = True
@@ -40,13 +45,14 @@ async def lifespan(app: FastAPI):
         logger.debug("[LIFESPAN] Initialising service container...")
 
         services = ServiceContainer()
-        app.state.services = services
+        services_registry = get_or_create_services_registry(app.state)
+        services_registry.register_current(services)
 
         logger.debug("[LIFESPAN] Registering services...")
 
         # Register database engines for each configured database
         for key, db_config in settings.database.items():
-            await app.state.services.register(
+            await services.register(
                 f"{key}_database_service",
                 ServiceLifetime.SINGLETON,
                 DatabaseEngineService.LifespanTasks.ctor,
@@ -57,7 +63,7 @@ async def lifespan(app: FastAPI):
         # Register generic session transient (use nested inject to specify engine)
         # Usage: Inject(AsyncSession, Inject("main_database_service"))
         # ServiceContainer infers type from ctor return annotation.
-        await app.state.services.register(
+        await services.register(
             None,  # Anonymous, resolve by type
             ServiceLifetime.TRANSIENT,
             DatabaseSessionServiceT.LifespanTasks.ctor,
@@ -66,7 +72,7 @@ async def lifespan(app: FastAPI):
 
         # Create semaphore services as example singletons
         for key, value in settings.semaphores.items():
-            await app.state.services.register(
+            await services.register(
                 f"{key}_semaphore_service",
                 ServiceLifetime.SINGLETON,
                 SemaphoreService.LifespanTasks.ctor,
@@ -74,14 +80,14 @@ async def lifespan(app: FastAPI):
                 value
             )
 
-        await app.state.services.register(
+        await services.register(
             "example_transient",
             ServiceLifetime.TRANSIENT,
             ExampleServiceT.LifespanTasks.ctor,
             ExampleServiceT.LifespanTasks.dtor
         )
 
-        await app.state.services.register(
+        await services.register(
             "example_generator_transient",
             ServiceLifetime.TRANSIENT,
             ExampleGeneratorServiceT.LifespanTasks.ctor,
@@ -89,7 +95,7 @@ async def lifespan(app: FastAPI):
         )
 
         # LMDB key-value store service (singleton per worker, resolve by type)
-        await app.state.services.register(
+        await services.register(
             None,
             ServiceLifetime.SINGLETON,
             StoreService.LifespanTasks.ctor,
@@ -110,10 +116,10 @@ async def lifespan(app: FastAPI):
             settings.store_lmdb.cleanup_max_deletes,
             settings.store_lmdb.callback_worker_threads,
         )
-        store_service: StoreService = await app.state.services.aget_by_type(StoreService)
+        store_service: StoreService = await services.aget_by_type(StoreService)
 
         # Temp file manager (singleton per worker, resolve by type)
-        await app.state.services.register(
+        await services.register(
             None,
             ServiceLifetime.SINGLETON,
             TempFileService.LifespanTasks.ctor,
@@ -125,10 +131,10 @@ async def lifespan(app: FastAPI):
             settings.tmp_worker_threads,
             settings.tmp_max_file_size_mb,
             settings.tmp_max_total_size_mb,
-            store_provider=lambda: app.state.services.aget_by_type(
+            store_provider=lambda: services.aget_by_type(
                 StoreService),
         )
-        temp_file_service: TempFileService = await app.state.services.aget_by_type(
+        temp_file_service: TempFileService = await services.aget_by_type(
             TempFileService
         )
         await temp_file_service.start_cleanup()
@@ -139,10 +145,12 @@ async def lifespan(app: FastAPI):
     finally:
         logger.debug("[LIFESPAN] Shutting down...")
 
-        active_services = services or getattr(app.state, "services", None)
-        if active_services is not None:
-            await active_services.destruct_all_singletons()
-            app.state.services = None
+        if services is not None:
+            try:
+                await services.destruct_all_singletons()
+            finally:
+                if services_registry is not None:
+                    services_registry.unregister_current(expected=services)
             logger.debug("[LIFESPAN] Service container released.")
         else:
             logger.debug("[LIFESPAN] Service container was not initialized.")

@@ -130,7 +130,10 @@ main.py                       # CLI runner for granian
 - Use `Inject("key")` for key-based resolution; use type-based injection only when a single service of that type exists.
 - For type-based resolution, `ServiceContainer` uses the factory (`ctor`) return annotation as the service type.
 - Session example: `session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`.
-- Do not resolve services outside an event loop or across multiple loops.
+- `ServiceContainer` itself is single-loop; do not use one container across event loops/threads.
+- Lifespan binds one container per current loop into `app.state.services_registry` (free-threaded safe).
+- `Inject(...)` resolves services only from `services_registry` (no fallback to `app.state.services`).
+- `StoreService` and `TempFileService` are process-shared in lifespan (same path/config reuses one instance with ref-counted teardown).
 - Singletons should not depend on transients unless explicitly allowed.
 
 ### Temporary files
@@ -148,6 +151,7 @@ main.py                       # CLI runner for granian
 
 - `StoreService` (registered anonymously, resolved by `StoreService` type) provides a local LMDB-backed key-value store with TTL.
 - Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
+- Callback metadata/job databases are isolated with a `v2` namespace to avoid crashes from legacy callback meta layout on old store paths.
 - `STORE_LMDB__MAX_DBS` controls user-namespace quota and must be `>= 0`; `0` disables the quota.
 - Namespaces marked as internal are excluded from user-namespace quota counting.
 - Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).
@@ -168,6 +172,7 @@ main.py                       # CLI runner for granian
 - Log files are rotated daily and retained for 7 days.
 - Avoid logging sensitive request bodies or tokens.
 - In debug mode, loguru `backtrace` and `diagnose` are enabled; disable in production.
+- Logging setup/teardown is process-shared and ref-counted so free-threaded workers do not duplicate handlers or tear logging down early.
 
 ### Middleware order
 
@@ -177,7 +182,9 @@ main.py                       # CLI runner for granian
 ### Concurrency model
 
 - Multi-worker mode is supported with constraints.
-- Each worker process has its own asyncio event loop and creates its own `ServiceContainer` during lifespan startup.
+- In process-worker mode, each worker process creates its own `ServiceContainer` during lifespan startup.
+- In free-threaded mode where workers can share one app object, each worker loop registers its own container in `app.state.services_registry`.
+- In free-threaded mode, workers in the same process reuse one `StoreService` / `TempFileService` backend instance (per path/config).
 - Never share in-memory service instances across workers; only share external state (LMDB/files/DB).
 - Background cleanup loops and callback dispatchers are leader-elected via file locks; at most one worker runs each loop at a time.
 - Expiry callback names must be deterministic and identical across workers for the same feature.
@@ -278,6 +285,7 @@ if "@" not in email:
 - `CORS_ORIGINS` defaults to empty; configure explicitly for browsers.
 - `DEBUG_MODE=true` exposes request body in validation errors; do not enable in production.
 - If transient services are resolved outside of a request context, their destructors will not run automatically.
+- Do not read/write `app.state.services` directly in application code; resolve via `Inject(...)` so loop-local registry routing is applied.
 - Temp-file size-limit breaches (`TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`) are logged as `error` and raised to callers as `ValueError`; the service continues running.
 - Expiry callback names missing in the active worker are logged as `error`; register callbacks consistently across workers.
 - Namespace-exclusive access now uses `create_namespace_lock()`; the legacy `exclusive()` API has been migrated.
