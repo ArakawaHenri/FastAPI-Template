@@ -613,6 +613,39 @@ async def test_duplicate_filename_suffix(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_save_metadata_failure_rolls_back_file_and_total_size(
+    tmp_path: Path, monkeypatch
+):
+    service, store = await _make_service(tmp_path)
+    created: list[str] = []
+    original_write_unique = service._write_unique
+
+    def capture_write_unique(base_name: str, data: bytes, now: float) -> str:
+        name = original_write_unique(base_name, data, now)
+        created.append(name)
+        return name
+
+    async def fail_set_metadata(*args, **kwargs):
+        raise RuntimeError("metadata down")
+
+    monkeypatch.setattr(service, "_write_unique", capture_write_unique)
+    monkeypatch.setattr(service, "_set_metadata", fail_set_metadata)
+
+    with pytest.raises(RuntimeError, match="metadata down"):
+        await service.save("rollback.txt", "payload")
+
+    assert created
+    rolled_back_name = created[0]
+    rolled_back_path = Path(service._config.base_dir) / rolled_back_name
+    assert not rolled_back_path.exists()
+    assert await service._get_metadata(rolled_back_name) is None
+    assert service._get_total_size_bytes() == 0
+
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_leading_dot_is_escaped(tmp_path: Path):
     service, store = await _make_service(tmp_path)
     name = await service.save(".env", "secret")
@@ -786,6 +819,8 @@ async def test_save_overwrite_metadata_failure_restores_previous_file(
 ):
     service, store = await _make_service(tmp_path)
     await service.save_overwrite("same.txt", "old")
+    previous_metadata = await service._get_metadata("same.txt")
+    previous_total_size = service._get_total_size_bytes()
 
     original_set_metadata = service._set_metadata
     failed_once = False
@@ -803,6 +838,49 @@ async def test_save_overwrite_metadata_failure_restores_previous_file(
         await service.save_overwrite("same.txt", "new")
 
     assert await service.read("same.txt") == "old"
+    assert await service._get_metadata("same.txt") == previous_metadata
+    assert service._get_total_size_bytes() == previous_total_size
+    base_dir = Path(service._config.base_dir)
+    internal_files = [
+        p.name
+        for p in base_dir.iterdir()
+        if p.name.startswith(TempFileService.INTERNAL_STAGING_PREFIX)
+        or p.name.startswith(TempFileService.INTERNAL_BACKUP_PREFIX)
+    ]
+    assert internal_files == []
+
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_save_overwrite_swap_failure_rolls_back_staging_and_metadata(
+    tmp_path: Path, monkeypatch
+):
+    service, store = await _make_service(tmp_path)
+    await service.save_overwrite("same.txt", "old")
+    previous_metadata = await service._get_metadata("same.txt")
+    previous_total_size = service._get_total_size_bytes()
+
+    def fail_swap(*args, **kwargs):
+        raise RuntimeError("swap down")
+
+    monkeypatch.setattr(service, "_swap_staged_overwrite", fail_swap)
+
+    with pytest.raises(RuntimeError, match="swap down"):
+        await service.save_overwrite("same.txt", "new")
+
+    assert await service.read("same.txt") == "old"
+    assert await service._get_metadata("same.txt") == previous_metadata
+    assert service._get_total_size_bytes() == previous_total_size
+    base_dir = Path(service._config.base_dir)
+    internal_files = [
+        p.name
+        for p in base_dir.iterdir()
+        if p.name.startswith(TempFileService.INTERNAL_STAGING_PREFIX)
+        or p.name.startswith(TempFileService.INTERNAL_BACKUP_PREFIX)
+    ]
+    assert internal_files == []
 
     await service.shutdown()
     await store.shutdown()
@@ -891,6 +969,25 @@ async def test_recalculate_total_size_now_repairs_counter(tmp_path: Path):
     await service._recalculate_total_size_now()
 
     assert service._get_total_size_bytes() == file_size
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recalculate_total_size_ignores_symlink_entries(tmp_path: Path):
+    service, store = await _make_service(tmp_path)
+    outside = tmp_path / "outside-size.bin"
+    outside.write_bytes(b"x" * 1024)
+    link = Path(service._config.base_dir) / "link-size.bin"
+    try:
+        os.symlink(outside, link)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink not supported on this platform")
+
+    service._total_size_bytes = 1234
+    await service._recalculate_total_size_now()
+
+    assert service._get_total_size_bytes() == 0
     await service.shutdown()
     await store.shutdown()
 

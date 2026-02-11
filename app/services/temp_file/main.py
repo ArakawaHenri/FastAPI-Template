@@ -486,32 +486,39 @@ class TempFileService(BaseService):
         revision = self._new_revision()
         self._assert_size_allowed(len(data), filename=base_name)
         async with self._write_guard:
-            await self._run_in_executor(
-                self._assert_total_capacity_for_write,
-                base_name,
-                len(data),
-                False,
-            )
-            now = time.time()
-            saved_name = await self._run_in_executor(
-                self._write_unique, base_name, data, now
-            )
-            self._total_size_bytes += len(data)
-        try:
-            await self._set_metadata(
-                saved_name,
-                is_text,
-                self._retention_minutes,
-                revision=revision,
-            )
-        except Exception:
-            deleted_size = await self._run_in_executor(self._delete_file, saved_name)
-            self._total_size_bytes -= deleted_size
-            logger.exception(
-                "[TMP] Failed to write metadata for temp file", name=saved_name)
-            raise
-
-        return saved_name
+            saved_name: str | None = None
+            try:
+                await self._run_in_executor(
+                    self._assert_total_capacity_for_write,
+                    base_name,
+                    len(data),
+                    False,
+                )
+                now = time.time()
+                saved_name = await self._run_in_executor(
+                    self._write_unique, base_name, data, now
+                )
+                self._total_size_bytes += len(data)
+                await self._set_metadata(
+                    saved_name,
+                    is_text,
+                    self._retention_minutes,
+                    revision=revision,
+                )
+                return saved_name
+            except Exception:
+                if saved_name is not None:
+                    try:
+                        await self._run_in_executor(self._delete_file, saved_name)
+                    except Exception:
+                        logger.exception(
+                            "[TMP] Failed deleting temp file during save rollback",
+                            name=saved_name,
+                        )
+                    await self._clear_metadata_best_effort(saved_name)
+                await self._refresh_total_size_counter_unlocked()
+                logger.exception("[TMP] Save failed; rolled back temp-file state")
+                raise
 
     async def save_overwrite(
         self,
@@ -529,56 +536,83 @@ class TempFileService(BaseService):
         is_text, data = self._normalize_content(content)
         revision = self._new_revision()
         self._assert_size_allowed(len(data), filename=base_name)
-        backup_name: str | None = None
         async with self._write_guard:
-            await self._run_in_executor(
-                self._assert_total_capacity_for_write,
-                base_name,
-                len(data),
-                True,
-            )
-            now = time.time()
-            staging_name = self._new_staging_name(base_name)
-            await self._run_in_executor(
-                self._write_staging_file,
-                staging_name,
-                data,
-                now,
-            )
-            self._total_size_bytes += len(data)  # Staging file added
-            backup_name = await self._run_in_executor(
-                self._swap_staged_overwrite,
-                base_name,
-                staging_name,
-            )
+            previous_metadata = await self._get_metadata(base_name)
+            backup_name: str | None = None
+            staging_name: str | None = None
+            swap_completed = False
             try:
+                await self._run_in_executor(
+                    self._assert_total_capacity_for_write,
+                    base_name,
+                    len(data),
+                    True,
+                )
+                now = time.time()
+                staging_name = self._new_staging_name(base_name)
+                await self._run_in_executor(
+                    self._write_staging_file,
+                    staging_name,
+                    data,
+                    now,
+                )
+                self._total_size_bytes += len(data)  # Staging file added
+                backup_name = await self._run_in_executor(
+                    self._swap_staged_overwrite,
+                    base_name,
+                    staging_name,
+                )
+                swap_completed = True
                 await self._set_metadata(
                     base_name,
                     is_text,
                     self._retention_minutes,
                     revision=revision,
                 )
-            except Exception:
-                # Rollback deletes the failed 'base' (which was 'staging') and restores backup.
-                # The rollback function returns the actual size deleted.
-                deleted_size = await self._run_in_executor(
-                    self._rollback_overwrite_after_metadata_failure,
-                    base_name,
-                    backup_name,
-                )
-                self._total_size_bytes -= deleted_size
-                logger.exception(
-                    "[TMP] Failed to write metadata for temp file", name=base_name
-                )
-                raise
-            else:
                 # Discard backup
                 deleted_size = await self._run_in_executor(
                     self._discard_backup_file, backup_name
                 )
                 self._total_size_bytes -= deleted_size
+                return base_name
+            except Exception:
+                if swap_completed:
+                    try:
+                        await self._run_in_executor(
+                            self._rollback_overwrite_after_metadata_failure,
+                            base_name,
+                            backup_name,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[TMP] Failed rollback after overwrite failure",
+                            name=base_name,
+                        )
+                elif staging_name is not None:
+                    try:
+                        await self._run_in_executor(self._delete_file, staging_name)
+                    except Exception:
+                        logger.exception(
+                            "[TMP] Failed deleting staging file during overwrite rollback",
+                            name=staging_name,
+                        )
 
-        return base_name
+                try:
+                    await self._restore_metadata_after_overwrite_failure(
+                        base_name,
+                        previous_metadata,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[TMP] Failed restoring metadata after overwrite failure",
+                        name=base_name,
+                    )
+                await self._refresh_total_size_counter_unlocked()
+                logger.exception(
+                    "[TMP] save_overwrite failed; rolled back temp-file state",
+                    name=base_name,
+                )
+                raise
 
     async def read(self, filename: str) -> Optional[str | bytes]:
         if not self._is_runtime_thread():
@@ -656,6 +690,47 @@ class TempFileService(BaseService):
                 retention=retention_minutes,
                 on_expire=self._callback_name,
             )
+
+    async def _clear_metadata_best_effort(self, name: str) -> None:
+        try:
+            namespace_escaped = self._store._encode_namespace(self._namespace)
+            key_bytes = self._store._encode_key(name)
+            async with self._store._write_lock:
+                await self._store._run_in_executor(
+                    self._store._delete_key,
+                    self._namespace,
+                    namespace_escaped,
+                    key_bytes,
+                    0,
+                )
+        except Exception:
+            logger.exception("[TMP] Failed clearing metadata", name=name)
+
+    async def _restore_metadata_after_overwrite_failure(
+        self,
+        name: str,
+        previous_metadata: tuple[bool, str] | None,
+    ) -> None:
+        path = self._base_dir / name
+        try:
+            if not path.exists() or not path.is_file() or path.is_symlink():
+                await self._clear_metadata_best_effort(name)
+                return
+        except Exception:
+            await self._clear_metadata_best_effort(name)
+            return
+
+        if previous_metadata is None:
+            await self._clear_metadata_best_effort(name)
+            return
+
+        is_text, revision = previous_metadata
+        await self._set_metadata(
+            name,
+            is_text,
+            self._retention_minutes,
+            revision=revision,
+        )
 
     async def _get_metadata(self, name: str) -> tuple[bool, str] | None:
         async with self._namespace_lock:
@@ -1453,5 +1528,9 @@ class TempFileService(BaseService):
 
     async def _recalculate_total_size_now(self) -> None:
         async with self._write_guard:
-            entries = await self._run_in_executor(self._scan_files)
-            self._total_size_bytes = sum(size for _, _, size in entries)
+            await self._refresh_total_size_counter_unlocked()
+
+    async def _refresh_total_size_counter_unlocked(self) -> None:
+        entries = await self._run_in_executor(self._scan_files)
+        # _scan_files ignores symlinks and non-regular files by design.
+        self._total_size_bytes = sum(size for _, _, size in entries)
