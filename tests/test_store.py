@@ -67,6 +67,26 @@ async def test_store_lifespan_ctor_rejects_shared_config_mismatch(tmp_path):
         await StoreService.LifespanTasks.dtor(store)
 
 
+@pytest.mark.asyncio
+async def test_store_lifespan_dtor_closes_non_shared_instance(tmp_path):
+    store = _make_store(tmp_path)
+    await StoreService.LifespanTasks.dtor(store)
+    assert store._closed
+
+
+@pytest.mark.asyncio
+async def test_store_lifespan_dtor_closes_instance_when_shared_registry_is_missing(tmp_path):
+    path = str(tmp_path / "store_lmdb")
+    store = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    key = store._shared_instance_key
+
+    with StoreService._shared_instances_lock:
+        StoreService._shared_instances.pop(key, None)
+
+    await StoreService.LifespanTasks.dtor(store)
+    assert store._closed
+
+
 def _worker_main(db_path: str, worker_id: int, start_event, error_queue):
     async def _run():
         store = StoreService(

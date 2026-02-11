@@ -151,7 +151,6 @@ main.py                       # CLI runner for granian
 
 - `StoreService` (registered anonymously, resolved by `StoreService` type) provides a local LMDB-backed key-value store with TTL.
 - Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
-- Callback metadata/job databases are isolated with a `v2` namespace to avoid crashes from legacy callback meta layout on old store paths.
 - `STORE_LMDB__MAX_DBS` controls user-namespace quota and must be `>= 0`; `0` disables the quota.
 - Namespaces marked as internal are excluded from user-namespace quota counting.
 - Cleanup runs on a single worker via a file lock (cross-platform via `portalocker`).

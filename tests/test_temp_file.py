@@ -184,6 +184,51 @@ async def test_temp_file_lifespan_ctor_rejects_shared_config_mismatch(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_temp_file_lifespan_dtor_closes_non_shared_instance(tmp_path: Path):
+    store = _make_store(tmp_path)
+    service = TempFileService(
+        TempFileConfig(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+        ),
+        store,
+    )
+
+    await TempFileService.LifespanTasks.dtor(service)
+    assert service._closed
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_temp_file_lifespan_dtor_closes_instance_when_shared_registry_is_missing(tmp_path: Path):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    service = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store,
+    )
+    key = service._shared_instance_key
+
+    with TempFileService._shared_instances_lock:
+        TempFileService._shared_instances.pop(key, None)
+
+    await TempFileService.LifespanTasks.dtor(service)
+    assert service._closed
+    await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
 async def test_temp_file_lifespan_ctor_waits_for_shared_bootstrap(tmp_path: Path, monkeypatch):
     store = await StoreService.LifespanTasks.ctor(
         path=str(tmp_path / "store_lmdb"),

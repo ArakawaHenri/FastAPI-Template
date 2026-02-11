@@ -151,7 +151,6 @@ main.py                       # granian 启动脚本
 
 - `StoreService`（匿名注册，按 `StoreService` 类型解析）提供本地 LMDB KV + TTL。
 - 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
-- 回调元数据/任务数据库已切到 `v2` 命名空间，用于隔离旧 store 路径上历史 callback 元数据布局带来的崩溃风险。
 - `STORE_LMDB__MAX_DBS` 用于控制用户 namespace 配额，必须 `>= 0`；`0` 表示关闭配额限制。
 - 被标记为 internal 的 namespace 不计入用户 namespace 配额。
 - 清理任务通过文件锁确保多 worker 只运行一个实例（依赖 `portalocker`）。

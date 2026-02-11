@@ -16,7 +16,13 @@ _LOGGING_STATE_LOCK = threading.Lock()
 _LOGGING_STATE_COND = threading.Condition(_LOGGING_STATE_LOCK)
 _LOGGING_REFCOUNT = 0
 _LOGGING_SHUTTING_DOWN = False
+_LOGGING_INITIALIZING = False
 _LOGGING_CONFIG: tuple[str, bool] | None = None
+
+_CONFIG_MISMATCH_WARNING = (
+    "setup_logging called with different config while logging is already initialized; "
+    "keeping existing config"
+)
 
 
 class InterceptHandler(logging.Handler):
@@ -36,28 +42,12 @@ class InterceptHandler(logging.Handler):
         )
 
 
-def setup_logging(log_dir: Path, debug: bool):
-    global _LOGGING_REFCOUNT, _LOGGING_CONFIG
+def _wait_for_logging_idle_locked() -> None:
+    while _LOGGING_SHUTTING_DOWN or _LOGGING_INITIALIZING:
+        _LOGGING_STATE_COND.wait()
 
-    normalized_log_dir = str(Path(log_dir).expanduser().resolve())
 
-    with _LOGGING_STATE_COND:
-        while _LOGGING_SHUTTING_DOWN:
-            _LOGGING_STATE_COND.wait()
-
-        if _LOGGING_REFCOUNT > 0:
-            requested_config = (normalized_log_dir, debug)
-            if _LOGGING_CONFIG != requested_config:
-                logger.warning(
-                    "setup_logging called with different config while logging is already initialized; "
-                    "keeping existing config"
-                )
-            _LOGGING_REFCOUNT += 1
-            return
-
-        _LOGGING_REFCOUNT = 1
-        _LOGGING_CONFIG = (normalized_log_dir, debug)
-
+def _configure_loguru(normalized_log_dir: str, debug: bool) -> None:
     logger.remove()
 
     console_level = "DEBUG" if debug else "INFO"
@@ -103,12 +93,52 @@ def setup_logging(log_dir: Path, debug: bool):
     logger.debug("Here logger stands.")
 
 
-async def shutdown_logging():
+def setup_logging(log_dir: Path, debug: bool) -> None:
+    global _LOGGING_REFCOUNT, _LOGGING_CONFIG, _LOGGING_INITIALIZING
+
+    normalized_log_dir = str(Path(log_dir).expanduser().resolve())
+    requested_config = (normalized_log_dir, debug)
+    should_configure = False
+    warn_config_mismatch = False
+
+    with _LOGGING_STATE_COND:
+        _wait_for_logging_idle_locked()
+
+        if _LOGGING_REFCOUNT > 0:
+            if _LOGGING_CONFIG != requested_config:
+                warn_config_mismatch = True
+            _LOGGING_REFCOUNT += 1
+        else:
+            _LOGGING_INITIALIZING = True
+            should_configure = True
+
+    if not should_configure:
+        if warn_config_mismatch:
+            logger.warning(_CONFIG_MISMATCH_WARNING)
+        return
+
+    try:
+        _configure_loguru(normalized_log_dir, debug)
+    except Exception:
+        with _LOGGING_STATE_COND:
+            _LOGGING_REFCOUNT = 0
+            _LOGGING_INITIALIZING = False
+            _LOGGING_CONFIG = None
+            _LOGGING_STATE_COND.notify_all()
+        raise
+
+    with _LOGGING_STATE_COND:
+        _LOGGING_REFCOUNT = 1
+        _LOGGING_CONFIG = requested_config
+        _LOGGING_INITIALIZING = False
+        _LOGGING_STATE_COND.notify_all()
+
+
+async def shutdown_logging() -> None:
     global _LOGGING_REFCOUNT, _LOGGING_SHUTTING_DOWN, _LOGGING_CONFIG
 
     with _LOGGING_STATE_COND:
-        while _LOGGING_SHUTTING_DOWN:
-            _LOGGING_STATE_COND.wait()
+        _wait_for_logging_idle_locked()
 
         if _LOGGING_REFCOUNT == 0:
             return

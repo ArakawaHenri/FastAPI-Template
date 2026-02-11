@@ -194,48 +194,94 @@ class StoreService(BaseService):
         )
 
     @classmethod
+    def _try_reuse_shared_locked(
+        cls,
+        key: str,
+        signature: tuple[Any, ...],
+    ) -> "StoreService" | None:
+        entry = cls._shared_instances.get(key)
+        if entry is None:
+            return None
+        if entry.instance._closed:
+            cls._shared_instances.pop(key, None)
+            return None
+        if entry.signature != signature:
+            raise RuntimeError(
+                "StoreService config mismatch for shared path "
+                f"'{key}'. Keep STORE_LMDB settings identical across workers."
+            )
+        entry.ref_count += 1
+        return entry.instance
+
+    @classmethod
+    def _register_new_shared_locked(
+        cls,
+        key: str,
+        signature: tuple[Any, ...],
+        config: StoreConfig,
+    ) -> "StoreService":
+        instance = cls(config)
+        instance._shared_registry_managed = True
+        instance._shared_instance_key = key
+        cls._shared_instances[key] = _SharedStoreEntry(
+            instance=instance,
+            signature=signature,
+            ref_count=1,
+        )
+        return instance
+
+    @classmethod
+    def _release_shared_locked(
+        cls,
+        key: str,
+        instance: "StoreService",
+    ) -> tuple[bool, bool]:
+        entry = cls._shared_instances.get(key)
+        if entry is None or entry.instance is not instance:
+            instance._shared_registry_managed = False
+            return (not instance._closed, True)
+
+        entry.ref_count -= 1
+        if entry.ref_count > 0:
+            return (False, False)
+
+        cls._shared_instances.pop(key, None)
+        instance._shared_registry_managed = False
+        return (True, False)
+
+    @classmethod
     async def acquire_shared(cls, config: StoreConfig) -> "StoreService":
         key = cls._shared_store_key(config.path)
         signature = cls._shared_store_signature(config)
         with cls._shared_instances_lock:
-            entry = cls._shared_instances.get(key)
-            if entry is not None:
-                if entry.instance._closed:
-                    cls._shared_instances.pop(key, None)
-                else:
-                    if entry.signature != signature:
-                        raise RuntimeError(
-                            "StoreService config mismatch for shared path "
-                            f"'{key}'. Keep STORE_LMDB settings identical across workers."
-                        )
-                    entry.ref_count += 1
-                    return entry.instance
-
-            instance = cls(config)
-            instance._shared_instance_key = key
-            cls._shared_instances[key] = _SharedStoreEntry(
-                instance=instance,
-                signature=signature,
-                ref_count=1,
-            )
-            return instance
+            shared = cls._try_reuse_shared_locked(key, signature)
+            if shared is not None:
+                return shared
+            return cls._register_new_shared_locked(key, signature, config)
 
     @classmethod
     async def release_shared(cls, instance: "StoreService") -> None:
-        key = getattr(instance, "_shared_instance_key", None)
-        if key is None:
+        if not getattr(instance, "_shared_registry_managed", False):
             await instance.shutdown()
             return
 
-        should_shutdown = False
+        key = getattr(instance, "_shared_instance_key", None)
+        if key is None:
+            instance._shared_registry_managed = False
+            await instance.shutdown()
+            return
+
         with cls._shared_instances_lock:
-            entry = cls._shared_instances.get(key)
-            if entry is None or entry.instance is not instance:
-                return
-            entry.ref_count -= 1
-            if entry.ref_count <= 0:
-                cls._shared_instances.pop(key, None)
-                should_shutdown = True
+            should_shutdown, inconsistent_registry_state = cls._release_shared_locked(
+                key,
+                instance,
+            )
+
+        if inconsistent_registry_state:
+            logger.warning(
+                "[STORE] Shared registry state mismatch during release; forcing shutdown",
+                key=key,
+            )
         if should_shutdown:
             await instance.shutdown()
 
@@ -348,6 +394,7 @@ class StoreService(BaseService):
             _RUNTIME_MAX_PENDING_CALLS
         )
         self._closed = False
+        self._shared_registry_managed = False
         self._shared_instance_key: str | None = self._shared_store_key(config.path)
         self._namespaces.update(self._list_namespaces())
         self._start_runtime_thread()
@@ -1601,6 +1648,8 @@ class StoreService(BaseService):
         )
 
     async def _run_in_executor(self, fn, *args, **kwargs):
+        # Store operations execute on the service runtime thread.
+        # This helper keeps the call signature aligned with other services.
         if kwargs:
             fn = partial(fn, **kwargs)
         return fn(*args)
@@ -1654,6 +1703,20 @@ class StoreService(BaseService):
                 return False
             return True
         return False
+
+    def _make_runtime_submit_releaser(self) -> Callable[[object], None]:
+        released = False
+        released_lock = threading.Lock()
+
+        def _release_slot(_fut: object = None) -> None:
+            nonlocal released
+            with released_lock:
+                if released:
+                    return
+                released = True
+            self._runtime_submit_semaphore.release()
+
+        return _release_slot
 
     @staticmethod
     def _try_acquire_file_lock(path: Path) -> Optional[TextIO]:
@@ -1881,32 +1944,23 @@ class StoreService(BaseService):
         if not acquired:
             raise TimeoutError("StoreService runtime queue is saturated")
 
-        released = False
-        released_lock = threading.Lock()
-
-        def _release_slot(_fut=None) -> None:
-            nonlocal released
-            with released_lock:
-                if released:
-                    return
-                released = True
-            self._runtime_submit_semaphore.release()
+        release_slot = self._make_runtime_submit_releaser()
 
         try:
             coro = fn(*args, **kwargs)
         except Exception:
-            _release_slot()
+            release_slot()
             raise
         if not inspect.isawaitable(coro):
-            _release_slot()
+            release_slot()
             raise TypeError("Runtime-dispatched function must return an awaitable")
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception:
             coro.close()
-            _release_slot()
+            release_slot()
             raise
-        future.add_done_callback(_release_slot)
+        future.add_done_callback(release_slot)
         return await asyncio.wrap_future(future)
 
     async def _stop_runtime_thread(self) -> None:

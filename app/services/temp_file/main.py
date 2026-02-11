@@ -117,6 +117,77 @@ class TempFileService(BaseService):
             config.max_total_size_mb,
         )
 
+    @classmethod
+    def _try_reuse_shared_locked(
+        cls,
+        key: str,
+        signature: tuple[Any, ...],
+    ) -> _SharedTempFileEntry | None:
+        entry = cls._shared_instances.get(key)
+        if entry is None:
+            return None
+        if entry.instance._closed:
+            cls._shared_instances.pop(key, None)
+            return None
+        if entry.signature != signature:
+            raise RuntimeError(
+                "TempFileService config mismatch for shared key "
+                f"'{key}'. Keep TMP_* settings identical across workers."
+            )
+        entry.ref_count += 1
+        return entry
+
+    @classmethod
+    def _register_new_shared_locked(
+        cls,
+        key: str,
+        signature: tuple[Any, ...],
+        config: TempFileConfig,
+        store: StoreService,
+    ) -> _SharedTempFileEntry:
+        service = TempFileService(config, store)
+        service._shared_registry_managed = True
+        service._shared_instance_key = key
+        entry = _SharedTempFileEntry(
+            instance=service,
+            signature=signature,
+            ref_count=1,
+        )
+        cls._shared_instances[key] = entry
+        return entry
+
+    @classmethod
+    def _rollback_waiter_ref_locked(
+        cls,
+        key: str,
+        entry: _SharedTempFileEntry,
+    ) -> None:
+        current = cls._shared_instances.get(key)
+        if current is not entry:
+            return
+        entry.ref_count -= 1
+        if entry.ref_count <= 0:
+            cls._shared_instances.pop(key, None)
+
+    @classmethod
+    def _release_shared_locked(
+        cls,
+        key: str,
+        instance: "TempFileService",
+    ) -> tuple[bool, bool]:
+        entry = cls._shared_instances.get(key)
+        if entry is None or entry.instance is not instance:
+            instance._shared_registry_managed = False
+            return (not instance._closed, True)
+
+        entry.ref_count -= 1
+        if entry.ref_count > 0:
+            return (False, False)
+
+        cls._shared_instances.pop(key, None)
+        instance._shared_registry_managed = False
+        return (True, False)
+
     @staticmethod
     async def _wait_shared_entry_ready(entry: _SharedTempFileEntry) -> None:
         await asyncio.to_thread(entry.ready.wait)
@@ -134,41 +205,23 @@ class TempFileService(BaseService):
         key = cls._shared_temp_key(config, store)
         signature = cls._shared_temp_signature(config)
         entry: _SharedTempFileEntry
-        created = False
         with cls._shared_instances_lock:
-            entry = cls._shared_instances.get(key)
-            if entry is not None and entry.instance._closed:
-                cls._shared_instances.pop(key, None)
-                entry = None
-
-            if entry is not None:
-                if entry.signature != signature:
-                    raise RuntimeError(
-                        "TempFileService config mismatch for shared key "
-                        f"'{key}'. Keep TMP_* settings identical across workers."
-                    )
-                entry.ref_count += 1
-            else:
-                service = TempFileService(config, store)
-                service._shared_instance_key = key
-                entry = _SharedTempFileEntry(
-                    instance=service,
-                    signature=signature,
-                    ref_count=1,
+            entry = cls._try_reuse_shared_locked(key, signature)
+            created = entry is None
+            if created:
+                entry = cls._register_new_shared_locked(
+                    key,
+                    signature,
+                    config,
+                    store,
                 )
-                cls._shared_instances[key] = entry
-                created = True
 
         if not created:
             try:
                 await cls._wait_shared_entry_ready(entry)
             except Exception:
                 with cls._shared_instances_lock:
-                    current = cls._shared_instances.get(key)
-                    if current is entry:
-                        entry.ref_count -= 1
-                        if entry.ref_count <= 0:
-                            cls._shared_instances.pop(key, None)
+                    cls._rollback_waiter_ref_locked(key, entry)
                 raise
             return entry.instance
 
@@ -193,20 +246,27 @@ class TempFileService(BaseService):
 
     @classmethod
     async def release_shared(cls, instance: "TempFileService") -> None:
-        key = getattr(instance, "_shared_instance_key", None)
-        if key is None:
+        if not getattr(instance, "_shared_registry_managed", False):
             await instance.shutdown()
             return
 
-        should_shutdown = False
+        key = getattr(instance, "_shared_instance_key", None)
+        if key is None:
+            instance._shared_registry_managed = False
+            await instance.shutdown()
+            return
+
         with cls._shared_instances_lock:
-            entry = cls._shared_instances.get(key)
-            if entry is None or entry.instance is not instance:
-                return
-            entry.ref_count -= 1
-            if entry.ref_count <= 0:
-                cls._shared_instances.pop(key, None)
-                should_shutdown = True
+            should_shutdown, inconsistent_registry_state = cls._release_shared_locked(
+                key,
+                instance,
+            )
+
+        if inconsistent_registry_state:
+            logger.warning(
+                "[TMP] Shared registry state mismatch during release; forcing shutdown",
+                key=key,
+            )
         if should_shutdown:
             await instance.shutdown()
 
@@ -252,6 +312,7 @@ class TempFileService(BaseService):
         )
         self._closed = False
         self._executor_shutdown = False
+        self._shared_registry_managed = False
         self._shared_instance_key: str | None = None
         self._start_runtime_thread()
 
@@ -1183,6 +1244,20 @@ class TempFileService(BaseService):
             return True
         return False
 
+    def _make_runtime_submit_releaser(self) -> Callable[[object], None]:
+        released = False
+        released_lock = threading.Lock()
+
+        def _release_slot(_fut: object = None) -> None:
+            nonlocal released
+            with released_lock:
+                if released:
+                    return
+                released = True
+            self._runtime_submit_semaphore.release()
+
+        return _release_slot
+
     def _is_runtime_thread(self) -> bool:
         return self._runtime_thread_id == threading.get_ident()
 
@@ -1250,32 +1325,23 @@ class TempFileService(BaseService):
         if not acquired:
             raise TimeoutError("TempFileService runtime queue is saturated")
 
-        released = False
-        released_lock = threading.Lock()
-
-        def _release_slot(_fut=None) -> None:
-            nonlocal released
-            with released_lock:
-                if released:
-                    return
-                released = True
-            self._runtime_submit_semaphore.release()
+        release_slot = self._make_runtime_submit_releaser()
 
         try:
             coro = fn(*args, **kwargs)
         except Exception:
-            _release_slot()
+            release_slot()
             raise
         if not inspect.isawaitable(coro):
-            _release_slot()
+            release_slot()
             raise TypeError("Runtime-dispatched function must return an awaitable")
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception:
             coro.close()
-            _release_slot()
+            release_slot()
             raise
-        future.add_done_callback(_release_slot)
+        future.add_done_callback(release_slot)
         return await asyncio.wrap_future(future)
 
     async def _stop_runtime_thread(self) -> None:
