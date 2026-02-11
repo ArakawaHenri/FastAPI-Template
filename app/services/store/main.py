@@ -14,7 +14,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, ClassVar, Optional, TextIO
@@ -34,6 +34,7 @@ _BUCKET_STRUCT = struct.Struct(">q")  # int64, epoch minutes
 _INT64_MAX = 2 ** 63 - 1
 _META_DB_NAME = b"__meta__"
 _META_NS_PREFIX = b"ns:"
+_META_NS_INTERNAL_PREFIX = b"nsi:"
 _CALLBACK_DB_NAME = b"__callbacks__"
 _EXP_DB_PREFIX = b"__exp__:"
 _EXPMETA_DB_PREFIX = b"__expmeta__:"
@@ -59,6 +60,12 @@ _INTERNAL_OPEN_MAX_DBS = 65535
 _MapFullError = getattr(lmdb, "MapFullError", None)
 _BadValsizeError = getattr(lmdb, "BadValsizeError", None)
 _DbsFullError = getattr(lmdb, "DbsFullError", None)
+
+
+def _new_signaled_event() -> threading.Event:
+    event = threading.Event()
+    event.set()
+    return event
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,8 @@ class _SharedStoreEntry:
     instance: "StoreService"
     signature: tuple[Any, ...]
     ref_count: int = 1
+    closing: bool = False
+    close_done: threading.Event = field(default_factory=_new_signaled_event)
 
 
 class StoreService(BaseService):
@@ -198,20 +207,22 @@ class StoreService(BaseService):
         cls,
         key: str,
         signature: tuple[Any, ...],
-    ) -> "StoreService" | None:
+    ) -> tuple["StoreService" | None, threading.Event | None]:
         entry = cls._shared_instances.get(key)
         if entry is None:
-            return None
+            return None, None
         if entry.instance._closed:
             cls._shared_instances.pop(key, None)
-            return None
+            return None, None
         if entry.signature != signature:
             raise RuntimeError(
                 "StoreService config mismatch for shared path "
                 f"'{key}'. Keep STORE_LMDB settings identical across workers."
             )
+        if entry.closing:
+            return None, entry.close_done
         entry.ref_count += 1
-        return entry.instance
+        return entry.instance, None
 
     @classmethod
     def _register_new_shared_locked(
@@ -235,29 +246,34 @@ class StoreService(BaseService):
         cls,
         key: str,
         instance: "StoreService",
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, _SharedStoreEntry | None]:
         entry = cls._shared_instances.get(key)
         if entry is None or entry.instance is not instance:
             instance._shared_registry_managed = False
-            return (not instance._closed, True)
+            return (not instance._closed, True, None)
 
         entry.ref_count -= 1
         if entry.ref_count > 0:
-            return (False, False)
+            return (False, False, None)
 
-        cls._shared_instances.pop(key, None)
+        entry.closing = True
+        entry.close_done.clear()
         instance._shared_registry_managed = False
-        return (True, False)
+        return (True, False, entry)
 
     @classmethod
     async def acquire_shared(cls, config: StoreConfig) -> "StoreService":
         key = cls._shared_store_key(config.path)
         signature = cls._shared_store_signature(config)
-        with cls._shared_instances_lock:
-            shared = cls._try_reuse_shared_locked(key, signature)
-            if shared is not None:
-                return shared
-            return cls._register_new_shared_locked(key, signature, config)
+        while True:
+            waiter: threading.Event | None = None
+            with cls._shared_instances_lock:
+                shared, waiter = cls._try_reuse_shared_locked(key, signature)
+                if shared is not None:
+                    return shared
+                if waiter is None:
+                    return cls._register_new_shared_locked(key, signature, config)
+            await asyncio.to_thread(waiter.wait)
 
     @classmethod
     async def release_shared(cls, instance: "StoreService") -> None:
@@ -271,8 +287,9 @@ class StoreService(BaseService):
             await instance.shutdown()
             return
 
+        closing_entry: _SharedStoreEntry | None = None
         with cls._shared_instances_lock:
-            should_shutdown, inconsistent_registry_state = cls._release_shared_locked(
+            should_shutdown, inconsistent_registry_state, closing_entry = cls._release_shared_locked(
                 key,
                 instance,
             )
@@ -282,8 +299,19 @@ class StoreService(BaseService):
                 "[STORE] Shared registry state mismatch during release; forcing shutdown",
                 key=key,
             )
-        if should_shutdown:
+        if not should_shutdown:
+            return
+
+        try:
             await instance.shutdown()
+        finally:
+            if closing_entry is not None:
+                with cls._shared_instances_lock:
+                    current = cls._shared_instances.get(key)
+                    if current is closing_entry:
+                        cls._shared_instances.pop(key, None)
+                    closing_entry.closing = False
+                    closing_entry.close_done.set()
 
     def __init__(self, config: StoreConfig) -> None:
         self._validate_config(config)
@@ -396,7 +424,9 @@ class StoreService(BaseService):
         self._closed = False
         self._shared_registry_managed = False
         self._shared_instance_key: str | None = self._shared_store_key(config.path)
-        self._namespaces.update(self._list_namespaces())
+        namespaces, internal_namespaces = self._list_namespace_metadata()
+        self._namespaces.update(namespaces)
+        self._internal_namespaces.update(internal_namespaces)
         self._start_runtime_thread()
 
         logger.debug("[STORE] StoreService initialized (zLMDB)")
@@ -506,7 +536,14 @@ class StoreService(BaseService):
         self._encode_namespace(namespace)
         async with self._namespace_lock:
             already_registered = namespace in self._namespaces
+            already_internal = namespace in self._internal_namespaces
             self._internal_namespaces.add(namespace)
+            if already_registered and not already_internal:
+                async with self._write_lock:
+                    await self._run_in_executor(
+                        self._mark_namespace_internal_in_meta,
+                        namespace,
+                    )
             if already_registered:
                 logger.info(
                     f"[STORE] Migrated existing namespace '{namespace}' to internal. "
@@ -877,14 +914,13 @@ class StoreService(BaseService):
         async with self._namespace_lock:
             if namespace in self._namespaces:
                 return
-            self._ensure_data_db_capacity(namespace)
-            self._get_db(namespace_escaped)
             if self._callback_guard.get():
                 raise RuntimeError(
                     "Expiry callbacks cannot register new namespaces during callback execution"
                 )
             async with self._write_lock:
                 await self._run_in_executor(self._register_namespace_in_meta, namespace)
+            self._get_db(namespace_escaped)
             self._namespaces.add(namespace)
 
     def _get_db(self, namespace: str) -> lmdb._Database:
@@ -1453,22 +1489,66 @@ class StoreService(BaseService):
         self._write_meta_txn_with_resize(_delete_meta, 0)
 
     def _register_namespace_in_meta(self, namespace: str) -> None:
-        meta_key = _META_NS_PREFIX + namespace.encode("utf-8")
+        namespace_raw = namespace.encode("utf-8")
+        meta_key = _META_NS_PREFIX + namespace_raw
+        namespace_internal_key = _META_NS_INTERNAL_PREFIX + namespace_raw
+        namespace_is_internal = namespace in self._internal_namespaces
 
         def _write(txn) -> None:
-            txn.put(meta_key, b"1", db=self._meta_db, overwrite=False)
+            exists = txn.get(meta_key, db=self._meta_db) is not None
+            if not exists and self._config.max_dbs != 0 and not namespace_is_internal:
+                current_user_namespaces = 0
+                with txn.cursor(db=self._meta_db) as cursor:
+                    if cursor.set_range(_META_NS_PREFIX):
+                        for key, _ in cursor:
+                            if not key.startswith(_META_NS_PREFIX):
+                                break
+                            existing_raw = bytes(key[len(_META_NS_PREFIX):])
+                            internal_key = _META_NS_INTERNAL_PREFIX + existing_raw
+                            if txn.get(internal_key, db=self._meta_db):
+                                continue
+                            current_user_namespaces += 1
+                if current_user_namespaces + 1 > self._config.max_dbs:
+                    raise RuntimeError(
+                        "LMDB namespace quota reached; increase store_lmdb.max_dbs or set 0 to disable the quota."
+                    )
+
+            if not exists:
+                txn.put(meta_key, b"1", db=self._meta_db, overwrite=False)
+            if namespace_is_internal:
+                txn.put(namespace_internal_key, b"1", db=self._meta_db, overwrite=True)
 
         self._write_meta_txn_with_resize(_write, 0)
 
-    def _list_namespaces(self) -> list[str]:
+    def _mark_namespace_internal_in_meta(self, namespace: str) -> None:
+        namespace_raw = namespace.encode("utf-8")
+        meta_key = _META_NS_PREFIX + namespace_raw
+        internal_key = _META_NS_INTERNAL_PREFIX + namespace_raw
+
+        def _write(txn) -> None:
+            if txn.get(meta_key, db=self._meta_db) is None:
+                return
+            txn.put(internal_key, b"1", db=self._meta_db, overwrite=True)
+
+        self._write_meta_txn_with_resize(_write, 0)
+
+    def _list_namespace_metadata(self) -> tuple[list[str], set[str]]:
         namespaces: list[str] = []
+        internal_namespaces: set[str] = set()
         with self._meta_env.begin(write=False) as txn, txn.cursor(db=self._meta_db) as cursor:
             if cursor.set_range(_META_NS_PREFIX):
                 for key, _ in cursor:
                     if not key.startswith(_META_NS_PREFIX):
                         break
-                    namespaces.append(
-                        key[len(_META_NS_PREFIX):].decode("utf-8"))
+                    raw_namespace = bytes(key[len(_META_NS_PREFIX):])
+                    namespace = raw_namespace.decode("utf-8")
+                    namespaces.append(namespace)
+                    if txn.get(_META_NS_INTERNAL_PREFIX + raw_namespace, db=self._meta_db):
+                        internal_namespaces.add(namespace)
+        return namespaces, internal_namespaces
+
+    def _list_namespaces(self) -> list[str]:
+        namespaces, _ = self._list_namespace_metadata()
         return namespaces
 
     def _open_env_db(self, env, name: bytes, db_type: str, **kwargs) -> lmdb._Database:
@@ -1490,21 +1570,6 @@ class StoreService(BaseService):
 
     def _open_meta_db(self, name: bytes, **kwargs) -> lmdb._Database:
         return self._open_env_db(self._meta_env, name, "meta", **kwargs)
-
-    def _ensure_data_db_capacity(self, namespace: str) -> None:
-        if self._config.max_dbs == 0:
-            return
-        if namespace in self._internal_namespaces:
-            return
-        current = 0
-        for name in self._namespaces:
-            if name in self._internal_namespaces:
-                continue
-            current += 1
-        if current + 1 > self._config.max_dbs:
-            raise RuntimeError(
-                "LMDB namespace quota reached; increase store_lmdb.max_dbs or set 0 to disable the quota."
-            )
 
     @staticmethod
     def _validate_config(config: StoreConfig) -> None:

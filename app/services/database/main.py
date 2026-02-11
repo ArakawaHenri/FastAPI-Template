@@ -44,7 +44,7 @@ class DatabaseEngineService(BaseService):
         @staticmethod
         async def dtor(instance: "DatabaseEngineService") -> None:
             await instance.engine.dispose()
-            logger.debug(f"Database engine disposed: {instance.db_name}")
+            logger.debug("[DB] Database engine disposed", db_name=instance.db_name)
 
     def __init__(
         self,
@@ -84,7 +84,7 @@ class DatabaseEngineService(BaseService):
             expire_on_commit=False,
         )
 
-        logger.debug(f"Database engine created: {self.db_name}")
+        logger.debug("[DB] Database engine created", db_name=self.db_name)
 
     @asynccontextmanager
     async def get_session(self) -> AsyncIterator[AsyncSession]:
@@ -106,7 +106,7 @@ class DatabaseEngineService(BaseService):
                 await conn.execute(text("SELECT 1"))
             return True
         except Exception:
-            logger.warning(f"Database health check failed: {self.db_name}")
+            logger.warning("[DB] Database health check failed", db_name=self.db_name)
             return False
 
 

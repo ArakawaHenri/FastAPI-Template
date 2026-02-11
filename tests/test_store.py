@@ -87,6 +87,39 @@ async def test_store_lifespan_dtor_closes_instance_when_shared_registry_is_missi
     assert store._closed
 
 
+@pytest.mark.asyncio
+async def test_store_acquire_shared_waits_for_inflight_shutdown(tmp_path):
+    path = str(tmp_path / "store_lmdb")
+    store = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+
+    shutdown_started = asyncio.Event()
+    release_shutdown = asyncio.Event()
+    original_shutdown = store.shutdown
+
+    async def delayed_shutdown() -> None:
+        shutdown_started.set()
+        await release_shutdown.wait()
+        await original_shutdown()
+
+    store.shutdown = delayed_shutdown  # type: ignore[method-assign]
+
+    release_task = asyncio.create_task(StoreService.release_shared(store))
+    await asyncio.wait_for(shutdown_started.wait(), timeout=2)
+
+    acquire_task = asyncio.create_task(StoreService.acquire_shared(store._config))
+    await asyncio.sleep(0.05)
+    assert not acquire_task.done()
+
+    release_shutdown.set()
+    await release_task
+    replacement = await asyncio.wait_for(acquire_task, timeout=3)
+
+    assert replacement is not store
+    assert store._closed
+
+    await StoreService.release_shared(replacement)
+
+
 def _worker_main(db_path: str, worker_id: int, start_event, error_queue):
     async def _run():
         store = StoreService(
@@ -617,6 +650,71 @@ async def test_internal_namespace_migration_after_registration(tmp_path):
     assert await store.get("another_user_ns", "k") == "v"
 
     await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_namespace_quota_enforced_across_store_instances(tmp_path):
+    config = StoreConfig(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+        map_size_growth_factor=2,
+        map_high_watermark=0.9,
+        max_dbs=1,
+        max_readers=256,
+        sync=False,
+        metasync=False,
+        writemap=True,
+        map_async=True,
+        max_key_bytes=256,
+        max_namespace_bytes=256,
+        max_value_bytes=2 * 1024 * 1024,
+        cleanup_max_deletes=10_000,
+        worker_threads=4,
+    )
+    store1 = StoreService(config)
+    store2 = StoreService(config)
+    try:
+        await store1.set("user_ns_1", "k", "v", retention=10)
+        with pytest.raises(RuntimeError, match="namespace quota"):
+            await store2.set("user_ns_2", "k", "v", retention=10)
+    finally:
+        await store1.shutdown()
+        await store2.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_internal_namespace_marker_persists_across_store_instances(tmp_path):
+    config = StoreConfig(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+        map_size_growth_factor=2,
+        map_high_watermark=0.9,
+        max_dbs=1,
+        max_readers=256,
+        sync=False,
+        metasync=False,
+        writemap=True,
+        map_async=True,
+        max_key_bytes=256,
+        max_namespace_bytes=256,
+        max_value_bytes=2 * 1024 * 1024,
+        cleanup_max_deletes=10_000,
+        worker_threads=4,
+    )
+    store1 = StoreService(config)
+    try:
+        await store1.mark_internal_namespace("tmp_files")
+        await store1.set("tmp_files", "k", True, retention=10)
+    finally:
+        await store1.shutdown()
+
+    store2 = StoreService(config)
+    try:
+        await store2.set("user_ns", "k", "v", retention=10)
+        with pytest.raises(RuntimeError, match="namespace quota"):
+            await store2.set("another_user_ns", "k", "v", retention=10)
+    finally:
+        await store2.shutdown()
 
 
 @pytest.mark.asyncio

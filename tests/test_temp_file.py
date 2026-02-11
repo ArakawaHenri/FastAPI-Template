@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services.store.main import StoreConfig, StoreService
+from app.services.store.main import ExpiryCallbackEvent, StoreConfig, StoreService
 from app.services.temp_file.main import TempFileConfig, TempFileService
 
 
@@ -398,6 +398,127 @@ async def test_temp_file_lifespan_ctor_does_not_deadlock_when_creator_is_cancell
 
 
 @pytest.mark.asyncio
+async def test_temp_file_lifespan_waiter_cancellation_releases_refcount(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_bootstrap = TempFileService._bootstrap
+
+    async def delayed_bootstrap(self: TempFileService) -> None:
+        if not self._is_runtime_thread():
+            started.set()
+            await release.wait()
+        await original_bootstrap(self)
+
+    monkeypatch.setattr(TempFileService, "_bootstrap", delayed_bootstrap)
+
+    creator = asyncio.create_task(
+        TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    waiter = asyncio.create_task(
+        TempFileService.LifespanTasks.ctor(
+            base_dir=str(tmp_path / "tmp_files"),
+            retention_days=1,
+            cleanup_interval_seconds=60,
+            total_size_recalc_seconds=60,
+            worker_threads=2,
+            max_file_size_mb=0,
+            max_total_size_mb=1,
+            store_provider=lambda: store,
+        )
+    )
+    await asyncio.sleep(0.05)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release.set()
+    service = await asyncio.wait_for(creator, timeout=3)
+    key = service._shared_instance_key
+    with TempFileService._shared_instances_lock:
+        entry = TempFileService._shared_instances.get(key)
+        assert entry is not None
+        assert entry.ref_count == 1
+
+    await TempFileService.LifespanTasks.dtor(service)
+    assert service._closed
+    await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
+async def test_temp_file_acquire_shared_waits_for_inflight_shutdown(tmp_path: Path):
+    store = await StoreService.LifespanTasks.ctor(
+        path=str(tmp_path / "store_lmdb"),
+        map_size_mb=16,
+    )
+    service = await TempFileService.LifespanTasks.ctor(
+        base_dir=str(tmp_path / "tmp_files"),
+        retention_days=1,
+        cleanup_interval_seconds=60,
+        total_size_recalc_seconds=60,
+        worker_threads=2,
+        max_file_size_mb=0,
+        max_total_size_mb=1,
+        store_provider=lambda: store,
+    )
+    key = service._shared_instance_key
+    assert key is not None
+
+    shutdown_started = asyncio.Event()
+    allow_shutdown = asyncio.Event()
+    original_shutdown = service.shutdown
+
+    async def delayed_shutdown() -> None:
+        if not service._is_runtime_thread():
+            shutdown_started.set()
+            await allow_shutdown.wait()
+        await original_shutdown()
+
+    service.shutdown = delayed_shutdown
+
+    release_task = asyncio.create_task(TempFileService.release_shared(service))
+    await asyncio.wait_for(shutdown_started.wait(), timeout=2)
+
+    acquire_task = asyncio.create_task(
+        TempFileService.acquire_shared(service._config, store)
+    )
+    await asyncio.sleep(0.05)
+    assert not acquire_task.done()
+
+    with TempFileService._shared_instances_lock:
+        entry = TempFileService._shared_instances.get(key)
+        assert entry is not None
+        assert entry.closing is True
+
+    allow_shutdown.set()
+    await asyncio.wait_for(release_task, timeout=3)
+    replacement = await asyncio.wait_for(acquire_task, timeout=3)
+
+    assert replacement is not service
+    assert not replacement._closed
+
+    await TempFileService.release_shared(replacement)
+    await StoreService.LifespanTasks.dtor(store)
+
+
+@pytest.mark.asyncio
 async def test_save_and_read_text(tmp_path: Path):
     service, store = await _make_service(tmp_path)
     name = await service.save("note.txt", "hello")
@@ -553,7 +674,7 @@ async def test_read_symlink_is_rejected(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_overwrite_symlink_replaces_with_regular_file(tmp_path: Path):
+async def test_overwrite_symlink_is_rejected(tmp_path: Path):
     service, store = await _make_service(tmp_path)
     target = tmp_path / "outside.txt"
     target.write_text("outside", encoding="utf-8")
@@ -563,10 +684,11 @@ async def test_overwrite_symlink_replaces_with_regular_file(tmp_path: Path):
     except (NotImplementedError, OSError):
         pytest.skip("symlink not supported on this platform")
 
-    await service.save_overwrite("swap.txt", "inside")
+    with pytest.raises(ValueError, match="Refusing to overwrite symlink"):
+        await service.save_overwrite("swap.txt", "inside")
     path = Path(service._config.base_dir) / "swap.txt"
-    assert not path.is_symlink()
-    assert await service.read("swap.txt") == "inside"
+    assert path.is_symlink()
+    assert await service.read("swap.txt") is None
     assert target.read_text(encoding="utf-8") == "outside"
 
     await service.shutdown()
@@ -574,7 +696,7 @@ async def test_overwrite_symlink_replaces_with_regular_file(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_overwrite_directory_symlink_replaces_with_regular_file(tmp_path: Path):
+async def test_overwrite_directory_symlink_is_rejected(tmp_path: Path):
     service, store = await _make_service(tmp_path)
     target_dir = tmp_path / "outside_dir"
     target_dir.mkdir()
@@ -584,10 +706,11 @@ async def test_overwrite_directory_symlink_replaces_with_regular_file(tmp_path: 
     except (NotImplementedError, OSError):
         pytest.skip("symlink not supported on this platform")
 
-    await service.save_overwrite("swap_dir.txt", "inside")
+    with pytest.raises(ValueError, match="Refusing to overwrite symlink"):
+        await service.save_overwrite("swap_dir.txt", "inside")
     path = Path(service._config.base_dir) / "swap_dir.txt"
-    assert not path.is_symlink()
-    assert await service.read("swap_dir.txt") == "inside"
+    assert path.is_symlink()
+    assert await service.read("swap_dir.txt") is None
     assert target_dir.exists() and target_dir.is_dir()
 
     await service.shutdown()
@@ -768,6 +891,28 @@ async def test_recalculate_total_size_now_repairs_counter(tmp_path: Path):
     await service._recalculate_total_size_now()
 
     assert service._get_total_size_bytes() == file_size
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_expiry_callback_ignores_key_outside_temp_dir(tmp_path: Path):
+    service, store = await _make_service(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+
+    event = ExpiryCallbackEvent(
+        namespace=service._namespace,
+        key="../outside.txt",
+        value=None,
+        expire_ts=0,
+        callback=service._callback_name,
+    )
+    await service._on_expire(event)
+
+    assert outside.exists()
+    assert outside.read_text(encoding="utf-8") == "outside"
+
     await service.shutdown()
     await store.shutdown()
 

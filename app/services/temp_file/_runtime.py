@@ -62,6 +62,8 @@ def tighten_directory_permissions(path: Path) -> None:
 
 
 def tighten_file_permissions(path: Path) -> None:
+    if not path.exists():
+        return
     try:
         os.chmod(path, 0o600)
     except Exception:

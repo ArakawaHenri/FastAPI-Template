@@ -30,6 +30,12 @@ _RUNTIME_MAX_PENDING_CALLS = 1024
 _RUNTIME_BLOCKING_WAIT_POLL_SECONDS = 0.1
 
 
+def _new_signaled_event() -> threading.Event:
+    event = threading.Event()
+    event.set()
+    return event
+
+
 @dataclass(frozen=True)
 class TempFileConfig:
     base_dir: str
@@ -49,6 +55,8 @@ class _SharedTempFileEntry:
     ref_count: int = 1
     ready: threading.Event = field(default_factory=threading.Event)
     init_error: BaseException | None = None
+    closing: bool = False
+    close_done: threading.Event = field(default_factory=_new_signaled_event)
 
 
 class TempFileService(BaseService):
@@ -122,20 +130,22 @@ class TempFileService(BaseService):
         cls,
         key: str,
         signature: tuple[Any, ...],
-    ) -> _SharedTempFileEntry | None:
+    ) -> tuple[_SharedTempFileEntry | None, threading.Event | None]:
         entry = cls._shared_instances.get(key)
         if entry is None:
-            return None
+            return None, None
         if entry.instance._closed:
             cls._shared_instances.pop(key, None)
-            return None
+            return None, None
         if entry.signature != signature:
             raise RuntimeError(
                 "TempFileService config mismatch for shared key "
                 f"'{key}'. Keep TMP_* settings identical across workers."
             )
+        if entry.closing:
+            return None, entry.close_done
         entry.ref_count += 1
-        return entry
+        return entry, None
 
     @classmethod
     def _register_new_shared_locked(
@@ -174,19 +184,20 @@ class TempFileService(BaseService):
         cls,
         key: str,
         instance: "TempFileService",
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, _SharedTempFileEntry | None]:
         entry = cls._shared_instances.get(key)
         if entry is None or entry.instance is not instance:
             instance._shared_registry_managed = False
-            return (not instance._closed, True)
+            return (not instance._closed, True, None)
 
         entry.ref_count -= 1
         if entry.ref_count > 0:
-            return (False, False)
+            return (False, False, None)
 
-        cls._shared_instances.pop(key, None)
+        entry.closing = True
+        entry.close_done.clear()
         instance._shared_registry_managed = False
-        return (True, False)
+        return (True, False, entry)
 
     @staticmethod
     async def _wait_shared_entry_ready(entry: _SharedTempFileEntry) -> None:
@@ -205,21 +216,32 @@ class TempFileService(BaseService):
         key = cls._shared_temp_key(config, store)
         signature = cls._shared_temp_signature(config)
         entry: _SharedTempFileEntry
-        with cls._shared_instances_lock:
-            entry = cls._try_reuse_shared_locked(key, signature)
-            created = entry is None
-            if created:
-                entry = cls._register_new_shared_locked(
-                    key,
-                    signature,
-                    config,
-                    store,
-                )
+        created = False
+        while True:
+            close_waiter: threading.Event | None = None
+            with cls._shared_instances_lock:
+                entry, close_waiter = cls._try_reuse_shared_locked(key, signature)
+                if entry is not None:
+                    created = False
+                elif close_waiter is None:
+                    entry = cls._register_new_shared_locked(
+                        key,
+                        signature,
+                        config,
+                        store,
+                    )
+                    created = True
+                else:
+                    created = False
+            if close_waiter is not None:
+                await asyncio.to_thread(close_waiter.wait)
+                continue
+            break
 
         if not created:
             try:
                 await cls._wait_shared_entry_ready(entry)
-            except Exception:
+            except BaseException:
                 with cls._shared_instances_lock:
                     cls._rollback_waiter_ref_locked(key, entry)
                 raise
@@ -256,8 +278,9 @@ class TempFileService(BaseService):
             await instance.shutdown()
             return
 
+        closing_entry: _SharedTempFileEntry | None = None
         with cls._shared_instances_lock:
-            should_shutdown, inconsistent_registry_state = cls._release_shared_locked(
+            should_shutdown, inconsistent_registry_state, closing_entry = cls._release_shared_locked(
                 key,
                 instance,
             )
@@ -267,8 +290,19 @@ class TempFileService(BaseService):
                 "[TMP] Shared registry state mismatch during release; forcing shutdown",
                 key=key,
             )
-        if should_shutdown:
+        if not should_shutdown:
+            return
+
+        try:
             await instance.shutdown()
+        finally:
+            if closing_entry is not None:
+                with cls._shared_instances_lock:
+                    current = cls._shared_instances.get(key)
+                    if current is closing_entry:
+                        cls._shared_instances.pop(key, None)
+                    closing_entry.closing = False
+                    closing_entry.close_done.set()
 
     def __init__(self, config: TempFileConfig, store: StoreService) -> None:
         self._validate_config(config)
@@ -743,6 +777,12 @@ class TempFileService(BaseService):
             return
         try:
             path = self._base_dir / event.key
+            if path.parent != self._base_dir:
+                logger.warning(
+                    "[TMP] Expiry callback skipped key outside temp dir",
+                    key=event.key,
+                )
+                return
             try:
                 mtime = await self._run_in_executor(self._get_mtime, path)
             except FileNotFoundError:
@@ -861,8 +901,11 @@ class TempFileService(BaseService):
             self._touch_file(path, now)
         except Exception:
             try:
-                if path.exists() or path.is_symlink():
+                st = path.lstat()
+                if stat.S_ISREG(st.st_mode):
                     path.unlink()
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.exception("[TMP] Failed to remove partial staging file")
             raise
@@ -879,7 +922,11 @@ class TempFileService(BaseService):
             except FileNotFoundError:
                 st = None
             if st is not None:
-                if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+                if stat.S_ISLNK(st.st_mode):
+                    raise ValueError(
+                        f"Refusing to overwrite symlink temp file: {base_name}"
+                    )
+                if not stat.S_ISREG(st.st_mode):
                     raise ValueError(f"Path is not a regular file: {base_name}")
                 backup_name = self._new_backup_name(base_name)
                 backup_path = self._base_dir / backup_name
@@ -891,14 +938,15 @@ class TempFileService(BaseService):
             return backup_name
         except Exception:
             try:
-                if staging_path.exists() or staging_path.is_symlink():
+                st = staging_path.lstat()
+                if stat.S_ISREG(st.st_mode):
                     staging_path.unlink()
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.exception("[TMP] Failed to remove staging file")
             if backup_moved and backup_path is not None:
                 try:
-                    if path.exists() or path.is_symlink():
-                        path.unlink()
                     os.replace(backup_path, path)
                     self._tighten_file_permissions(path)
                 except Exception:
@@ -929,7 +977,11 @@ class TempFileService(BaseService):
         except FileNotFoundError:
             st = None
         if st is not None:
-            if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+            if stat.S_ISLNK(st.st_mode):
+                raise ValueError(
+                    f"Refusing rollback on symlink temp file: {base_name}"
+                )
+            if not stat.S_ISREG(st.st_mode):
                 raise ValueError(f"Path is not a regular file: {base_name}")
             deleted_size = st.st_size
             path.unlink()
@@ -943,13 +995,23 @@ class TempFileService(BaseService):
         return self._delete_file(backup_name)
 
     def _touch_file(self, path: Path, now: float) -> None:
+        st = path.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError(f"Refusing to touch symlink temp file: {path.name}")
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Path is not a regular file: {path.name}")
         os.utime(path, (now, now))
 
     def _delete_file(self, name: str) -> int:
         path = self._base_dir / name
         try:
             st = path.lstat()
-            if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            if stat.S_ISLNK(st.st_mode):
+                logger.warning(
+                    "[TMP] Refusing to delete symlink temp file", name=name
+                )
+                return 0
+            if stat.S_ISREG(st.st_mode):
                 size = st.st_size
                 path.unlink()
                 return size
@@ -1168,14 +1230,7 @@ class TempFileService(BaseService):
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        try:
-            fd = os.open(path, flags, 0o600)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP and path.is_symlink():
-                path.unlink()
-                fd = os.open(path, flags, 0o600)
-            else:
-                raise
+        fd = os.open(path, flags, 0o600)
         try:
             with os.fdopen(fd, "wb", closefd=False) as handle:
                 handle.write(data)
