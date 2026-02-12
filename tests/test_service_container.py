@@ -12,7 +12,7 @@ from app.core.dependencies import (
     ServiceContainer,
     ServiceContainerRegistry,
     ServiceLifetime,
-    get_or_create_services_registry,
+    get_or_create_service_container_registry,
     resolve_service_container,
 )
 
@@ -401,7 +401,7 @@ async def test_service_container_registry_rejects_different_container_on_same_lo
 async def test_resolve_service_container_prefers_registry():
     current = ServiceContainer()
     app_state = SimpleNamespace()
-    registry = get_or_create_services_registry(app_state)
+    registry = get_or_create_service_container_registry(app_state)
     registry.register_current(current)
     try:
         assert resolve_service_container(app_state) is current

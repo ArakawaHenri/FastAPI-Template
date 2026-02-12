@@ -126,19 +126,25 @@ main.py                       # CLI runner for granian
 ### Services and DI
 
 - Naming: singletons end with `Service`, transients end with `ServiceT`.
-- Register services in `app/lifespan/main.py` with either a key or anonymous type-based registration.
+- Register services via decorators:
+`@Service("key", lifetime=..., eager=...)` and
+`@ServiceDict("template", dict=..., lifetime=..., eager=...)`.
+- `lifetime` accepts `ServiceLifetime`, `0/1`, or
+`"Singleton"/"Transient"` (case-insensitive) and defaults to singleton.
+- `eager=True` is singleton-only and instantiates at startup.
 - Use `Inject("key")` for key-based resolution; use type-based injection only when a single service of that type exists.
 - For type-based resolution, `ServiceContainer` uses the factory (`ctor`) return annotation as the service type.
 - Session example: `session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`.
 - `ServiceContainer` itself is single-loop; do not use one container across event loops/threads.
-- Lifespan binds one container per current loop into `app.state.services_registry` (free-threaded safe).
-- `Inject(...)` resolves services only from `services_registry` (no fallback to `app.state.services`).
+- Lifespan binds one container per current loop into `app.state.sc_registry` (free-threaded safe).
+- `Inject(...)` resolves services only from `sc_registry` (no fallback to `app.state.services`).
 - `StoreService` and `TempFileService` are process-shared in lifespan (same path/config reuses one instance with ref-counted teardown).
 - Singletons should not depend on transients unless explicitly allowed.
 
 ### Temporary files
 
-- `TempFileService` (registered anonymously, resolved by `TempFileService` type) manages temporary files under `TMP_DIR`.
+- `TempFileService` is registered as key `temp_file_service` and type `TempFileService`.
+- It is configured as eager singleton and manages temporary files under `TMP_DIR`.
 - `TMP_MAX_FILE_SIZE_MB` enforces a per-file size cap for both save and read (`0` means unlimited).
 - `TMP_MAX_TOTAL_SIZE_MB` enforces a global temp-dir size cap for writes (`0` means unlimited).
 - `TMP_TOTAL_SIZE_RECALC_SECONDS` controls periodic total-size recalculation (enabled only when `TMP_MAX_TOTAL_SIZE_MB > 0`).
@@ -149,7 +155,8 @@ main.py                       # CLI runner for granian
 
 ### LMDB store
 
-- `StoreService` (registered anonymously, resolved by `StoreService` type) provides a local LMDB-backed key-value store with TTL.
+- `StoreService` is registered as key `store_service` and type `StoreService`.
+- It is configured as eager singleton and provides a local LMDB-backed key-value store with TTL.
 - Expiration uses a secondary index plus an expmeta DB to avoid reading old payloads on overwrite.
 - `STORE_LMDB__MAX_DBS` controls user-namespace quota and must be `>= 0`; `0` disables the quota.
 - Namespaces marked as internal are excluded from user-namespace quota counting.
@@ -157,9 +164,9 @@ main.py                       # CLI runner for granian
 
 ### Lifespan
 
-- Register all services in lifespan to control creation order and teardown.
+- Lifespan imports service modules, reads `ServiceRegistry`, performs DAG ordering + cycle checks, and auto-registers services.
 - For contextmanager-style services, yield the instance exactly once and ensure cleanup in `finally`.
-- Avoid heavy work at import time; defer to lifespan registration.
+- Keep import-time side effects limited to lightweight metadata registration (decorators).
 
 ### Error handling
 
@@ -182,7 +189,7 @@ main.py                       # CLI runner for granian
 
 - Multi-worker mode is supported with constraints.
 - In process-worker mode, each worker process creates its own `ServiceContainer` during lifespan startup.
-- In free-threaded mode where workers can share one app object, each worker loop registers its own container in `app.state.services_registry`.
+- In free-threaded mode where workers can share one app object, each worker loop registers its own container in `app.state.sc_registry`.
 - In free-threaded mode, workers in the same process reuse one `StoreService` / `TempFileService` backend instance (per path/config).
 - Never share in-memory service instances across workers; only share external state (LMDB/files/DB).
 - Background cleanup loops and callback dispatchers are leader-elected via file locks; at most one worker runs each loop at a time.

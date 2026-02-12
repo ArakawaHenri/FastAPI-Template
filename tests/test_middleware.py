@@ -15,7 +15,7 @@ from app.core.dependencies import (
     ServiceContainer,
     ServiceLifetime,
     TransientServiceFinalizerMiddleware,
-    get_or_create_services_registry,
+    get_or_create_service_container_registry,
 )
 from app.core.logger import request_id_ctx
 from app.core.settings import settings
@@ -132,7 +132,7 @@ class TestTransientServiceFinalizerMiddleware:
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             services = ServiceContainer()
-            registry = get_or_create_services_registry(app.state)
+            registry = get_or_create_service_container_registry(app.state)
             registry.register_current(services)
 
             async def factory():

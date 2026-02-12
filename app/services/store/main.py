@@ -16,7 +16,8 @@ from typing import Any, ClassVar, Optional
 import zlmdb.lmdb as lmdb
 from loguru import logger
 
-from app.services import BaseService
+from app.core.settings import settings
+from app.services import BaseService, Service
 
 from . import _runtime
 from ._callback_engine import CallbackLogThrottler
@@ -91,6 +92,7 @@ class _SharedStoreEntry:
     close_done: threading.Event = field(default_factory=_new_signaled_event)
 
 
+@Service("store_service", eager=True)
 class StoreService(
     StoreStorageDataPathMixin,
     StoreCallbackPipelineMixin,
@@ -109,23 +111,23 @@ class StoreService(
     class LifespanTasks(BaseService.LifespanTasks):
         @staticmethod
         async def ctor(
-            path: str,
-            map_size_mb: int = 1024,
-            map_size_growth_factor: int = 2,
-            map_high_watermark: float = 0.8,
-            max_dbs: int = 256,
-            max_readers: int = 512,
-            sync: bool = False,
-            metasync: bool = True,
-            writemap: bool = True,
-            map_async: bool = True,
-            max_key_bytes: int = 256,
-            max_namespace_bytes: int = 256,
-            max_value_bytes: int = 100 * 1024 * 1024,
-            cleanup_max_deletes: int = 1_000_000,
-            worker_threads: int = 4,
+            path: str = settings.store_lmdb.path,
+            map_size_mb: int = settings.store_lmdb.map_size_mb,
+            map_size_growth_factor: int = settings.store_lmdb.map_size_growth_factor,
+            map_high_watermark: float = settings.store_lmdb.map_high_watermark,
+            max_dbs: int = settings.store_lmdb.max_dbs,
+            max_readers: int = settings.store_lmdb.max_readers,
+            sync: bool = settings.store_lmdb.sync,
+            metasync: bool = settings.store_lmdb.metasync,
+            writemap: bool = settings.store_lmdb.writemap,
+            map_async: bool = settings.store_lmdb.map_async,
+            max_key_bytes: int = settings.store_lmdb.max_key_bytes,
+            max_namespace_bytes: int = settings.store_lmdb.max_namespace_bytes,
+            max_value_bytes: int = settings.store_lmdb.max_value_bytes,
+            cleanup_max_deletes: int = settings.store_lmdb.cleanup_max_deletes,
+            worker_threads: int = settings.store_lmdb.callback_worker_threads,
         ) -> "StoreService":
-            return await StoreService.acquire_shared(
+            store = await StoreService.acquire_shared(
                 StoreConfig(
                     path=path,
                     map_size_mb=map_size_mb,
@@ -144,6 +146,8 @@ class StoreService(
                     worker_threads=worker_threads,
                 )
             )
+            await store.start_cleanup()
+            return store
 
         @staticmethod
         async def dtor(instance: "StoreService") -> None:

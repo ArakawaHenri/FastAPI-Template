@@ -126,19 +126,24 @@ main.py                       # granian 启动脚本
 ### 服务与依赖注入
 
 - 命名规范：单例以 `Service` 结尾，瞬态以 `ServiceT` 结尾。
-- 在 `app/lifespan/main.py` 注册服务时，可使用 key 或匿名按类型注册。
+- 通过装饰器注册服务：
+`@Service("key", lifetime=..., eager=...)` 与
+`@ServiceDict("template", dict=..., lifetime=..., eager=...)`。
+- `lifetime` 支持 `ServiceLifetime`、`0/1`、`"Singleton"/"Transient"`（大小写不敏感），默认单例。
+- `eager=True` 仅支持单例，表示启动时立即实例化。
 - `Inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
 - 类型注入时，`ServiceContainer` 会以工厂函数（`ctor`）的返回注解作为服务类型。
 - Session 示例：`session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`。
 - `ServiceContainer` 本身是单事件循环模型，不要跨事件循环或线程复用同一个容器。
-- Lifespan 会将“当前循环对应的容器”绑定到 `app.state.services_registry`（可适配 free-threaded worker）。
-- `Inject(...)` 只会从 `services_registry` 解析服务（不再回退到 `app.state.services`）。
+- Lifespan 会将“当前循环对应的容器”绑定到 `app.state.sc_registry`（可适配 free-threaded worker）。
+- `Inject(...)` 只会从 `sc_registry` 解析服务（不再回退到 `app.state.services`）。
 - `StoreService` 与 `TempFileService` 在 lifespan 中按进程共享（同路径/配置复用同一实例，并通过引用计数析构）。
 - 除特别设置外，单例默认不依赖瞬态服务。
 
 ### 临时文件
 
-- `TempFileService`（匿名注册，按 `TempFileService` 类型解析）在 `TMP_DIR` 下管理临时文件。
+- `TempFileService` 以 key `temp_file_service` 与类型 `TempFileService` 注册。
+- 默认为 eager 单例，在 `TMP_DIR` 下管理临时文件。
 - `TMP_MAX_FILE_SIZE_MB` 会限制 `save/read` 的单文件最大大小（`0` 表示不限）。
 - `TMP_MAX_TOTAL_SIZE_MB` 会限制临时目录写入总容量（`0` 表示不限）。
 - `TMP_TOTAL_SIZE_RECALC_SECONDS` 控制总大小周期重算（仅在 `TMP_MAX_TOTAL_SIZE_MB > 0` 时启用）。
@@ -149,7 +154,8 @@ main.py                       # granian 启动脚本
 
 ### LMDB 存储
 
-- `StoreService`（匿名注册，按 `StoreService` 类型解析）提供本地 LMDB KV + TTL。
+- `StoreService` 以 key `store_service` 与类型 `StoreService` 注册。
+- 默认为 eager 单例，提供本地 LMDB KV + TTL。
 - 过期使用二级索引与 expmeta DB，避免覆写时读取旧 payload。
 - `STORE_LMDB__MAX_DBS` 用于控制用户 namespace 配额，必须 `>= 0`；`0` 表示关闭配额限制。
 - 被标记为 internal 的 namespace 不计入用户 namespace 配额。
@@ -157,9 +163,9 @@ main.py                       # granian 启动脚本
 
 ### Lifespan
 
-- 所有服务在 lifespan 中注册与释放，确保生命周期清晰。
+- Lifespan 会自动导入服务模块，读取 `ServiceRegistry`，做依赖 DAG 排序与环检测后自动注册服务。
 - 使用 contextmanager 风格服务时，仅 `yield` 一次返回实例，并在 `finally` 中清理。
-- 避免在 import 时创建重资源。
+- import 阶段只做轻量元数据注册（装饰器），避免重资源副作用。
 
 ### 错误处理
 
@@ -182,7 +188,7 @@ main.py                       # granian 启动脚本
 
 - 支持多 worker，但需要满足约束条件。
 - 进程 worker 模式下，每个 worker 进程会在 lifespan 启动时创建自己的 `ServiceContainer`。
-- free-threaded 模式下，如果多个 worker 共享同一个 app 对象，每个 worker 事件循环会在 `app.state.services_registry` 中注册自己的容器。
+- free-threaded 模式下，如果多个 worker 共享同一个 app 对象，每个 worker 事件循环会在 `app.state.sc_registry` 中注册自己的容器。
 - free-threaded 模式下，同一进程内的 worker 会复用同一个 `StoreService` / `TempFileService` 后端实例（按路径/配置划分）。
 - 不要在 worker 之间共享内存态服务实例；只共享外部状态（LMDB/文件/数据库）。
 - 后台清理循环和回调分发通过文件锁进行主 worker 选举，同一时刻最多一个 worker 执行对应循环。

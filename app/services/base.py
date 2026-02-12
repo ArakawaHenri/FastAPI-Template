@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from app.core.service_registry import Service, ServiceDict, require
+
 
 class BaseService(ABC):
     """
@@ -24,3 +26,12 @@ class BaseService(ABC):
 
 
 type LifespanTasks = BaseService.LifespanTasks
+
+
+__all__ = [
+    "BaseService",
+    "LifespanTasks",
+    "Service",
+    "ServiceDict",
+    "require",
+]

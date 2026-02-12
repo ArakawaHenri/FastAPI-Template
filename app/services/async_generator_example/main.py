@@ -4,9 +4,10 @@ from typing import AsyncIterator
 
 from loguru import logger
 
-from app.services import BaseService
+from app.services import BaseService, Service
 
 
+@Service("example_generator_transient", lifetime="transient")
 class ExampleGeneratorServiceT(BaseService):
     class LifespanTasks(BaseService.LifespanTasks):
         @staticmethod

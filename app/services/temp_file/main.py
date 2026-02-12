@@ -17,7 +17,8 @@ from urllib.parse import quote
 
 from loguru import logger
 
-from app.services import BaseService
+from app.core.settings import settings
+from app.services import BaseService, Service, require
 from app.services.store import StoreService
 
 from . import _runtime
@@ -56,6 +57,7 @@ class _SharedTempFileEntry:
     close_done: threading.Event = field(default_factory=_new_signaled_event)
 
 
+@Service("temp_file_service", eager=True)
 class TempFileService(
     TempFileRuntimeDispatchMixin,
     TempFileMetadataMixin,
@@ -81,17 +83,17 @@ class TempFileService(
     class LifespanTasks(BaseService.LifespanTasks):
         @staticmethod
         async def ctor(
-            base_dir: str,
-            retention_days: int,
-            cleanup_interval_seconds: int = 60,
-            total_size_recalc_seconds: int = 60 * 60,
-            worker_threads: int = 4,
-            max_file_size_mb: int = 0,
-            max_total_size_mb: int = 0,
-            store_provider=None,
+            base_dir: str = settings.tmp_dir,
+            retention_days: int = settings.tmp_retention_days,
+            cleanup_interval_seconds: int = settings.tmp_cleanup_interval_seconds,
+            total_size_recalc_seconds: int = settings.tmp_total_size_recalc_seconds,
+            worker_threads: int = settings.tmp_worker_threads,
+            max_file_size_mb: int = settings.tmp_max_file_size_mb,
+            max_total_size_mb: int = settings.tmp_max_total_size_mb,
+            store_provider=require("store_service"),
         ) -> "TempFileService":
             store = await TempFileService._resolve_store_provider(store_provider)
-            return await TempFileService.acquire_shared(
+            service = await TempFileService.acquire_shared(
                 TempFileConfig(
                     base_dir=base_dir,
                     retention_days=retention_days,
@@ -103,6 +105,8 @@ class TempFileService(
                 ),
                 store,
             )
+            await service.start_cleanup()
+            return service
 
         @staticmethod
         async def dtor(instance: "TempFileService") -> None:
