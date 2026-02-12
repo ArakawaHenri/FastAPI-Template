@@ -32,6 +32,13 @@ from ._types import (
     _CallbackRegistration,
 )
 
+__all__ = [
+    "StoreConfig",
+    "StoreService",
+    "ExpiryCallbackEvent",
+    "ExpiryCallbackDeferred",
+]
+
 _INT64_MAX = 2 ** 63 - 1
 _META_DB_NAME = b"__meta__"
 _CALLBACK_DB_NAME = b"__callbacks__"

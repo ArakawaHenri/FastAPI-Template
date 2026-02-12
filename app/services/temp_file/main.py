@@ -18,13 +18,14 @@ from urllib.parse import quote
 from loguru import logger
 
 from app.services import BaseService
-from app.services.store import ExpiryCallbackDeferred, ExpiryCallbackEvent, StoreService
+from app.services.store import StoreService
 
 from . import _runtime
 from ._file_ops import TempFileFileOpsMixin
 from ._metadata import TempFileMetadataMixin
 from ._reconciler import TempFileReconcilerMixin
 from ._runtime_dispatch import TempFileRuntimeDispatchMixin
+
 
 def _new_signaled_event() -> threading.Event:
     event = threading.Event()
