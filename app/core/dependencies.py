@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import os
 import threading
@@ -33,6 +34,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 T = TypeVar("T")
 REQUEST_FAILED_STATE_KEY = "_svc_request_failed"
+_CURRENT_REQUEST_CTX: contextvars.ContextVar[Request | None] = contextvars.ContextVar(
+    "_svc_current_request",
+    default=None,
+)
 
 # Factory (ctor) may return:
 # - a plain instance T
@@ -587,170 +592,173 @@ class ServiceContainer:
 
         # Enforce single-loop usage for all resolution paths.
         self._ensure_event_loop()
+        token = _CURRENT_REQUEST_CTX.set(request)
+        try:
+            if isinstance(service, ServiceContainer.SingletonService):
+                # Singleton resolution.
+                if args or kwargs:
+                    logger.warning(
+                        f"Arguments given for singleton service '{key_label}' are ignored."
+                    )
+                if self.destructing:
+                    msg = f"Requesting service '{key_label}' while container is destructing."
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+                if service.instance is not None:
+                    return service.instance
 
-        if isinstance(service, ServiceContainer.SingletonService):
-            # Singleton resolution.
-            if args or kwargs:
-                logger.warning(
-                    f"Arguments given for singleton service '{key_label}' are ignored."
-                )
-            if self.destructing:
-                msg = f"Requesting service '{key_label}' while container is destructing."
-                logger.error(msg)
-                raise RuntimeError(msg)
-            if service.instance is not None:
+                await service.async_create_instance()
+                logger.debug(f"Singleton service created: {key_label}")
                 return service.instance
 
-            await service.async_create_instance()
-            logger.debug(f"Singleton service created: {key_label}")
-            return service.instance
+            # Transient resolution.
+            ctor = service.ctor
+            dtor = service.dtor
+            finalizer: Optional[Callable[[], Awaitable[None]]] = None
 
-        # Transient resolution.
-        ctor = service.ctor
-        dtor = service.dtor
-        finalizer: Optional[Callable[[], Awaitable[None]]] = None
-
-        # Execute factory: async directly, sync in a background thread to avoid blocking.
-        if inspect.iscoroutinefunction(ctor):
-            result = await ctor(*args, **kwargs)
-        else:
-            # Run sync factories in a separate thread to avoid blocking the loop.
-            result = await asyncio.to_thread(ctor, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-
-        # Async contextmanager-style factory.
-        if inspect.isasyncgen(result):
-            agen = result
-            try:
-                instance = await agen.__anext__()
-            except StopAsyncIteration:
-                raise RuntimeError(
-                    f"Async contextmanager service '{key_label}' did not yield a value."
-                )  # noqa: B904
-
-            async def _close_gen() -> None:
-                """
-                Finalize a transient async contextmanager service using
-                async-contextmanager semantics (exactly one yield).
-
-                On success, advance once to completion so `else/finally` runs.
-                On failure, throw an internal signal so `except/finally` runs.
-                Any additional yielded value is treated as a contract violation.
-                """
-                try:
-                    if _request_failed():
-                        signal = _RequestFailedSignal()
-                        try:
-                            await agen.athrow(signal)
-                        except StopAsyncIteration:
-                            return
-                        except _RequestFailedSignal:
-                            return
-                        raise RuntimeError(
-                            f"Async contextmanager service '{key_label}' must yield exactly once."
-                        )
-                    try:
-                        await agen.__anext__()
-                    except StopAsyncIteration:
-                        return
-                    raise RuntimeError(
-                        f"Async contextmanager service '{key_label}' must yield exactly once."
-                    )
-                finally:
-                    await agen.aclose()
-
-            if dtor:
-                logger.warning(
-                    f"Async contextmanager service '{key_label}' should use `async with` or "
-                    f"`yield ... finally` for cleanup instead of a separate destructor."
-                )
-                dtor_finalizer = self._make_async_finalizer(dtor, instance)
-
-                async def _finalizer() -> None:
-                    try:
-                        await dtor_finalizer()
-                    finally:
-                        await _close_gen()
-
-                finalizer = _finalizer
+            # Execute factory: async directly, sync in a background thread to avoid blocking.
+            if inspect.iscoroutinefunction(ctor):
+                result = await ctor(*args, **kwargs)
             else:
-                finalizer = _close_gen
+                # Run sync factories in a separate thread to avoid blocking the loop.
+                result = await asyncio.to_thread(ctor, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
 
-        # Synchronous contextmanager-style factory.
-        elif inspect.isgenerator(result):
-            gen = result
-            try:
-                instance = next(gen)
-            except StopIteration:
-                msg = f"Contextmanager service '{key_label}' did not yield a value."
-                logger.error(msg)
-                raise RuntimeError(msg)  # noqa: B904
+            # Async contextmanager-style factory.
+            if inspect.isasyncgen(result):
+                agen = result
+                try:
+                    instance = await agen.__anext__()
+                except StopAsyncIteration:
+                    raise RuntimeError(
+                        f"Async contextmanager service '{key_label}' did not yield a value."
+                    )  # noqa: B904
 
-            async def _close_gen() -> None:
-                """
-                Finalize a transient contextmanager service using
-                contextmanager semantics (exactly one yield).
+                async def _close_gen() -> None:
+                    """
+                    Finalize a transient async contextmanager service using
+                    async-contextmanager semantics (exactly one yield).
 
-                On success, advance once to completion so `else/finally` runs.
-                On failure, throw an internal signal so `except/finally` runs.
-                Any additional yielded value is treated as a contract violation.
-                """
-
-                def _finalize_gen() -> None:
+                    On success, advance once to completion so `else/finally` runs.
+                    On failure, throw an internal signal so `except/finally` runs.
+                    Any additional yielded value is treated as a contract violation.
+                    """
                     try:
                         if _request_failed():
                             signal = _RequestFailedSignal()
                             try:
-                                gen.throw(signal)
-                            except StopIteration:
+                                await agen.athrow(signal)
+                            except StopAsyncIteration:
                                 return
                             except _RequestFailedSignal:
                                 return
                             raise RuntimeError(
-                                f"Contextmanager service '{key_label}' must yield exactly once."
+                                f"Async contextmanager service '{key_label}' must yield exactly once."
                             )
                         try:
-                            next(gen)
-                        except StopIteration:
+                            await agen.__anext__()
+                        except StopAsyncIteration:
                             return
                         raise RuntimeError(
-                            f"Contextmanager service '{key_label}' must yield exactly once."
+                            f"Async contextmanager service '{key_label}' must yield exactly once."
                         )
-                    except _RequestFailedSignal:
-                        return
                     finally:
-                        gen.close()
+                        await agen.aclose()
 
-                await asyncio.to_thread(_finalize_gen)
+                if dtor:
+                    logger.warning(
+                        f"Async contextmanager service '{key_label}' should use `async with` or "
+                        f"`yield ... finally` for cleanup instead of a separate destructor."
+                    )
+                    dtor_finalizer = self._make_async_finalizer(dtor, instance)
 
-            if dtor:
-                logger.warning(
-                    f"Contextmanager service '{key_label}' should use `with` or "
-                    f"`yield ... finally` for cleanup instead of a separate destructor."
-                )
-                dtor_finalizer = self._make_async_finalizer(dtor, instance)
+                    async def _finalizer() -> None:
+                        try:
+                            await dtor_finalizer()
+                        finally:
+                            await _close_gen()
 
-                async def _finalizer() -> None:
-                    try:
-                        await dtor_finalizer()
-                    finally:
-                        await _close_gen()
+                    finalizer = _finalizer
+                else:
+                    finalizer = _close_gen
 
-                finalizer = _finalizer
+            # Synchronous contextmanager-style factory.
+            elif inspect.isgenerator(result):
+                gen = result
+                try:
+                    instance = next(gen)
+                except StopIteration:
+                    msg = f"Contextmanager service '{key_label}' did not yield a value."
+                    logger.error(msg)
+                    raise RuntimeError(msg)  # noqa: B904
+
+                async def _close_gen() -> None:
+                    """
+                    Finalize a transient contextmanager service using
+                    contextmanager semantics (exactly one yield).
+
+                    On success, advance once to completion so `else/finally` runs.
+                    On failure, throw an internal signal so `except/finally` runs.
+                    Any additional yielded value is treated as a contract violation.
+                    """
+
+                    def _finalize_gen() -> None:
+                        try:
+                            if _request_failed():
+                                signal = _RequestFailedSignal()
+                                try:
+                                    gen.throw(signal)
+                                except StopIteration:
+                                    return
+                                except _RequestFailedSignal:
+                                    return
+                                raise RuntimeError(
+                                    f"Contextmanager service '{key_label}' must yield exactly once."
+                                )
+                            try:
+                                next(gen)
+                            except StopIteration:
+                                return
+                            raise RuntimeError(
+                                f"Contextmanager service '{key_label}' must yield exactly once."
+                            )
+                        except _RequestFailedSignal:
+                            return
+                        finally:
+                            gen.close()
+
+                    await asyncio.to_thread(_finalize_gen)
+
+                if dtor:
+                    logger.warning(
+                        f"Contextmanager service '{key_label}' should use `with` or "
+                        f"`yield ... finally` for cleanup instead of a separate destructor."
+                    )
+                    dtor_finalizer = self._make_async_finalizer(dtor, instance)
+
+                    async def _finalizer() -> None:
+                        try:
+                            await dtor_finalizer()
+                        finally:
+                            await _close_gen()
+
+                    finalizer = _finalizer
+                else:
+                    finalizer = _close_gen
+
+            # Plain object.
             else:
-                finalizer = _close_gen
+                instance = result
+                if dtor:
+                    finalizer = self._make_async_finalizer(dtor, instance)
 
-        # Plain object.
-        else:
-            instance = result
-            if dtor:
-                finalizer = self._make_async_finalizer(dtor, instance)
+            if finalizer is not None:
+                self._attach_finalizer_to_request(request, finalizer)
 
-        if finalizer is not None:
-            self._attach_finalizer_to_request(request, finalizer)
-
-        return instance
+            return instance
+        finally:
+            _CURRENT_REQUEST_CTX.reset(token)
 
     # --------------------------------------------------------------------- #
     # Public API                                                            #
@@ -863,6 +871,12 @@ class ServiceContainer:
         into service-resolution calls, for attaching transient finalizers.
         """
         return f"_svc_request_{id(self)}"
+
+    def current_request(self) -> Request | None:
+        """
+        Return the currently resolving request context, if any.
+        """
+        return _CURRENT_REQUEST_CTX.get()
 
     def _request_ctx_key(self) -> str:
         """
@@ -1064,20 +1078,20 @@ class ServiceContainerRegistry:
 _APP_STATE_REGISTRY_LOCK = threading.Lock()
 
 
-def get_or_create_services_registry(app_state: Any) -> ServiceContainerRegistry:
+def get_or_create_service_container_registry(app_state: Any) -> ServiceContainerRegistry:
     """
     Return the app-level ServiceContainerRegistry, creating it if necessary.
     """
-    registry = getattr(app_state, "services_registry", None)
+    registry = getattr(app_state, "sc_registry", None)
     if isinstance(registry, ServiceContainerRegistry):
         return registry
 
     with _APP_STATE_REGISTRY_LOCK:
-        registry = getattr(app_state, "services_registry", None)
+        registry = getattr(app_state, "sc_registry", None)
         if isinstance(registry, ServiceContainerRegistry):
             return registry
         registry = ServiceContainerRegistry()
-        app_state.services_registry = registry
+        app_state.sc_registry = registry
         return registry
 
 
@@ -1091,7 +1105,7 @@ def resolve_service_container(app_state: Any) -> Optional[ServiceContainer]:
     if app_state is None:
         return None
 
-    registry = getattr(app_state, "services_registry", None)
+    registry = getattr(app_state, "sc_registry", None)
     if isinstance(registry, ServiceContainerRegistry):
         return registry.get_current()
     return None
@@ -1180,7 +1194,7 @@ def Inject(
         services = resolve_service_container(getattr(request.app, "state", None))
         if services is None:
             msg = (
-                "Service container not initialized for the current event loop on FastAPI app state."
+                "Service container not initialized for the current event loop on FastAPI app state (sc_registry)."
             )
             logger.error(msg)
             raise RuntimeError(msg)

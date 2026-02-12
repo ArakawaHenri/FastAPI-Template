@@ -13,9 +13,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.services import BaseService
+from app.core.settings import settings
+from app.services import BaseService, Service, ServiceDict
 
 
+@ServiceDict("{}_database_service", dict=settings.database)
 class DatabaseEngineService(BaseService):
     """
     Async database engine service with connection pooling.
@@ -110,6 +112,11 @@ class DatabaseEngineService(BaseService):
             return False
 
 
+@Service(
+    "database_session_service",
+    lifetime="transient",
+    exposed_type=AsyncSession,
+)
 class DatabaseSessionServiceT(BaseService):
     """
     Transient database session service.

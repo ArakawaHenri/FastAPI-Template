@@ -8,24 +8,18 @@ from loguru import logger
 
 from app.core.dependencies import (
     ServiceContainer,
-    ServiceLifetime,
-    get_or_create_services_registry,
+    get_or_create_service_container_registry,
 )
 from app.core.logger import setup_logging, shutdown_logging
+from app.core.service_registry import import_service_modules, register_services_from_registry
 from app.core.settings import settings
-from app.services.async_generator_example import ExampleGeneratorServiceT
-from app.services.database import DatabaseEngineService, DatabaseSessionServiceT
-from app.services.semaphore import SemaphoreService
-from app.services.store import StoreService
-from app.services.temp_file import TempFileService
-from app.services.transient_example import ExampleServiceT
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging_initialized = False
     services: ServiceContainer | None = None
-    services_registry = None
+    sc_registry = None
     try:
         setup_logging(Path(settings.log_dir), settings.debug_mode)
         logging_initialized = True
@@ -45,100 +39,16 @@ async def lifespan(app: FastAPI):
         logger.debug("[LIFESPAN] Initialising service container...")
 
         services = ServiceContainer()
-        services_registry = get_or_create_services_registry(app.state)
-        services_registry.register_current(services)
+        sc_registry = get_or_create_service_container_registry(app.state)
+        sc_registry.register_current(services)
 
-        logger.debug("[LIFESPAN] Registering services...")
-
-        # Register database engines for each configured database
-        for key, db_config in settings.database.items():
-            await services.register(
-                f"{key}_database_service",
-                ServiceLifetime.SINGLETON,
-                DatabaseEngineService.LifespanTasks.ctor,
-                DatabaseEngineService.LifespanTasks.dtor,
-                **db_config.model_dump()
-            )
-
-        # Register generic session transient (use nested inject to specify engine)
-        # Usage: Inject(AsyncSession, Inject("main_database_service"))
-        # ServiceContainer infers type from ctor return annotation.
-        await services.register(
-            None,  # Anonymous, resolve by type
-            ServiceLifetime.TRANSIENT,
-            DatabaseSessionServiceT.LifespanTasks.ctor,
-            None  # Cleanup handled by async generator
+        logger.debug("[LIFESPAN] Registering services via decorators...")
+        import_service_modules()
+        registered_keys = await register_services_from_registry(services)
+        logger.debug(
+            "[LIFESPAN] Auto registration completed",
+            count=len(registered_keys),
         )
-
-        # Create semaphore services as example singletons
-        for key, value in settings.semaphores.items():
-            await services.register(
-                f"{key}_semaphore_service",
-                ServiceLifetime.SINGLETON,
-                SemaphoreService.LifespanTasks.ctor,
-                SemaphoreService.LifespanTasks.dtor,
-                value
-            )
-
-        await services.register(
-            "example_transient",
-            ServiceLifetime.TRANSIENT,
-            ExampleServiceT.LifespanTasks.ctor,
-            ExampleServiceT.LifespanTasks.dtor
-        )
-
-        await services.register(
-            "example_generator_transient",
-            ServiceLifetime.TRANSIENT,
-            ExampleGeneratorServiceT.LifespanTasks.ctor,
-            ExampleGeneratorServiceT.LifespanTasks.dtor
-        )
-
-        # LMDB key-value store service (singleton per worker, resolve by type)
-        await services.register(
-            None,
-            ServiceLifetime.SINGLETON,
-            StoreService.LifespanTasks.ctor,
-            StoreService.LifespanTasks.dtor,
-            settings.store_lmdb.path,
-            settings.store_lmdb.map_size_mb,
-            settings.store_lmdb.map_size_growth_factor,
-            settings.store_lmdb.map_high_watermark,
-            settings.store_lmdb.max_dbs,
-            settings.store_lmdb.max_readers,
-            settings.store_lmdb.sync,
-            settings.store_lmdb.metasync,
-            settings.store_lmdb.writemap,
-            settings.store_lmdb.map_async,
-            settings.store_lmdb.max_key_bytes,
-            settings.store_lmdb.max_namespace_bytes,
-            settings.store_lmdb.max_value_bytes,
-            settings.store_lmdb.cleanup_max_deletes,
-            settings.store_lmdb.callback_worker_threads,
-        )
-        store_service: StoreService = await services.aget_by_type(StoreService)
-
-        # Temp file manager (singleton per worker, resolve by type)
-        await services.register(
-            None,
-            ServiceLifetime.SINGLETON,
-            TempFileService.LifespanTasks.ctor,
-            TempFileService.LifespanTasks.dtor,
-            settings.tmp_dir,
-            settings.tmp_retention_days,
-            settings.tmp_cleanup_interval_seconds,
-            settings.tmp_total_size_recalc_seconds,
-            settings.tmp_worker_threads,
-            settings.tmp_max_file_size_mb,
-            settings.tmp_max_total_size_mb,
-            store_provider=lambda: services.aget_by_type(
-                StoreService),
-        )
-        temp_file_service: TempFileService = await services.aget_by_type(
-            TempFileService
-        )
-        await temp_file_service.start_cleanup()
-        await store_service.start_cleanup()
 
         yield
 
@@ -149,8 +59,8 @@ async def lifespan(app: FastAPI):
             try:
                 await services.destruct_all_singletons()
             finally:
-                if services_registry is not None:
-                    services_registry.unregister_current(expected=services)
+                if sc_registry is not None:
+                    sc_registry.unregister_current(expected=services)
             logger.debug("[LIFESPAN] Service container released.")
         else:
             logger.debug("[LIFESPAN] Service container was not initialized.")
