@@ -625,11 +625,11 @@ async def test_save_metadata_failure_rolls_back_file_and_total_size(
         created.append(name)
         return name
 
-    async def fail_set_metadata(*args, **kwargs):
+    async def fail_write_metadata(*args, **kwargs):
         raise RuntimeError("metadata down")
 
     monkeypatch.setattr(service, "_write_unique", capture_write_unique)
-    monkeypatch.setattr(service, "_set_metadata", fail_set_metadata)
+    monkeypatch.setattr(service, "_write_metadata", fail_write_metadata)
 
     with pytest.raises(RuntimeError, match="metadata down"):
         await service.save("rollback.txt", "payload")
@@ -638,7 +638,7 @@ async def test_save_metadata_failure_rolls_back_file_and_total_size(
     rolled_back_name = created[0]
     rolled_back_path = Path(service._config.base_dir) / rolled_back_name
     assert not rolled_back_path.exists()
-    assert await service._get_metadata(rolled_back_name) is None
+    assert await service._read_metadata(rolled_back_name) is None
     assert service._get_total_size_bytes() == 0
 
     await service.shutdown()
@@ -814,15 +814,69 @@ async def test_save_overwrite_is_not_deleted_by_stale_expiry_callback(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_temp_file_shutdown_unreg_but_pending_callbacks_recover_on_next_bootstrap(
+    tmp_path: Path,
+):
+    service1, store = await _make_service(tmp_path, retention_days=1)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+    service2: TempFileService | None = None
+
+    try:
+        saved_name = await service1.save("old.txt", "stale")
+        saved_path = Path(service1._config.base_dir) / saved_name
+        await store.cleanup_expired(now=time.time() + 2 * 24 * 60 * 60)
+        assert store._count_callback_jobs() > 0
+        assert saved_path.exists()
+
+        await service1.shutdown()
+
+        assert service1._callback_name not in store._callback_registry
+        assert service1._callback_name in store._builtin_callbacks
+
+        StoreService._release_file_lock(callback_lock)
+        callback_lock = None
+
+        await asyncio.sleep(1.2)
+        assert store._count_callback_jobs() > 0
+        assert saved_path.exists()
+
+        service2 = TempFileService(
+            TempFileConfig(
+                base_dir=str(tmp_path / "tmp_files"),
+                retention_days=1,
+                cleanup_interval_seconds=60,
+                worker_threads=2,
+            ),
+            store,
+        )
+        await service2._bootstrap()
+        await asyncio.wait_for(
+            store.wait_for_callbacks(timeout=5, callback_name=service2._callback_name),
+            timeout=6,
+        )
+
+        assert store._count_callback_jobs() == 0
+    finally:
+        if callback_lock is not None:
+            StoreService._release_file_lock(callback_lock)
+        if service2 is not None:
+            await service2.shutdown()
+        await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_save_overwrite_metadata_failure_restores_previous_file(
     tmp_path: Path, monkeypatch
 ):
     service, store = await _make_service(tmp_path)
     await service.save_overwrite("same.txt", "old")
-    previous_metadata = await service._get_metadata("same.txt")
+    previous_metadata = await service._read_metadata("same.txt")
     previous_total_size = service._get_total_size_bytes()
 
-    original_set_metadata = service._set_metadata
+    original_write_metadata = service._write_metadata
     failed_once = False
 
     async def fail_once(*args, **kwargs):
@@ -830,15 +884,15 @@ async def test_save_overwrite_metadata_failure_restores_previous_file(
         if not failed_once:
             failed_once = True
             raise RuntimeError("metadata down")
-        return await original_set_metadata(*args, **kwargs)
+        return await original_write_metadata(*args, **kwargs)
 
-    monkeypatch.setattr(service, "_set_metadata", fail_once)
+    monkeypatch.setattr(service, "_write_metadata", fail_once)
 
     with pytest.raises(RuntimeError, match="metadata down"):
         await service.save_overwrite("same.txt", "new")
 
     assert await service.read("same.txt") == "old"
-    assert await service._get_metadata("same.txt") == previous_metadata
+    assert await service._read_metadata("same.txt") == previous_metadata
     assert service._get_total_size_bytes() == previous_total_size
     base_dir = Path(service._config.base_dir)
     internal_files = [
@@ -859,7 +913,7 @@ async def test_save_overwrite_swap_failure_rolls_back_staging_and_metadata(
 ):
     service, store = await _make_service(tmp_path)
     await service.save_overwrite("same.txt", "old")
-    previous_metadata = await service._get_metadata("same.txt")
+    previous_metadata = await service._read_metadata("same.txt")
     previous_total_size = service._get_total_size_bytes()
 
     def fail_swap(*args, **kwargs):
@@ -871,7 +925,7 @@ async def test_save_overwrite_swap_failure_rolls_back_staging_and_metadata(
         await service.save_overwrite("same.txt", "new")
 
     assert await service.read("same.txt") == "old"
-    assert await service._get_metadata("same.txt") == previous_metadata
+    assert await service._read_metadata("same.txt") == previous_metadata
     assert service._get_total_size_bytes() == previous_total_size
     base_dir = Path(service._config.base_dir)
     internal_files = [
@@ -954,6 +1008,33 @@ async def test_cleanup_untracked_files(tmp_path: Path):
     await service.cleanup_expired(now=time.time())
 
     assert not untracked.exists()
+    await service.shutdown()
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_files_uses_store_get_many(tmp_path: Path, monkeypatch):
+    service, store = await _make_service(tmp_path, retention_days=1)
+    await service.save("tracked.txt", "ok")
+
+    get_many_calls = 0
+    original_get_many = store.get_many
+
+    async def tracked_get_many(namespace: str, keys: list[str] | tuple[str, ...]):
+        nonlocal get_many_calls
+        if not store._is_runtime_thread():
+            get_many_calls += 1
+        return await original_get_many(namespace, keys)
+
+    async def fail_get(*_args, **_kwargs):
+        raise RuntimeError("_reconcile_files should use StoreService.get_many")
+
+    monkeypatch.setattr(store, "get_many", tracked_get_many)
+    monkeypatch.setattr(store, "get", fail_get)
+
+    await service._reconcile_files(now=time.time(), adopt_fresh=False)
+
+    assert get_many_calls == 1
     await service.shutdown()
     await store.shutdown()
 

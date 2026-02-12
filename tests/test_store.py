@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from app.services.store.main import StoreConfig, StoreService
+import app.services.store.main as store_main
+from app.services.store.main import ExpiryCallbackDeferred, StoreConfig, StoreService
 
 
 def _make_store(
@@ -213,6 +214,18 @@ async def test_get_missing_key_returns_none(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_many_returns_values_and_none_for_missing(tmp_path):
+    store = _make_store(tmp_path)
+    await store.set("default", "k1", "v1", retention=10)
+    await store.set("default", "k2", {"ok": True}, retention=10)
+
+    values = await store.get_many("default", ["k1", "k2", "missing"])
+
+    assert values == {"k1": "v1", "k2": {"ok": True}, "missing": None}
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_store_expiry_callback(tmp_path):
     store = _make_store(tmp_path)
     events: list[tuple[str, str, object | None, int]] = []
@@ -295,6 +308,7 @@ async def test_store_expiry_callback_timeout_retries_then_dead_letters(tmp_path)
     assert drained is True
     assert attempts == 2
     assert store._count_callback_jobs() == 0
+    assert store._count_callback_jobs_for("slow") == 0
     assert store._count_dead_letter_callback_jobs() == 1
 
     await store.shutdown()
@@ -337,6 +351,7 @@ async def test_store_expiry_callback_moves_to_dead_letter_after_retry_limit(tmp_
 
     assert attempts == 2
     assert store._count_callback_jobs() == 0
+    assert store._count_callback_jobs_for("always_fail") == 0
     assert store._count_dead_letter_callback_jobs() == 1
 
     await store.shutdown()
@@ -486,6 +501,234 @@ async def test_store_expiry_callback_survives_restart(tmp_path):
     assert expire_ts > 0
 
     await store2.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_missing_callback_handler_is_deferred_until_re_registered(tmp_path):
+    store = _make_store(tmp_path)
+    await store.register_builtin_callback("on_expire")
+
+    async def initial_handler(_event):
+        return None
+
+    await store.register_expiry_callback("on_expire", initial_handler)
+    await store.set("default", "k1", "v1", retention=1, on_expire="on_expire")
+    await store.unregister_expiry_callback("on_expire")
+
+    await store.cleanup_expired(now=time.time() + 120)
+    await asyncio.sleep(1.2)
+
+    assert store._count_callback_jobs() == 1
+    assert store._count_dead_letter_callback_jobs() == 0
+
+    restored_events: list[tuple[str, str, object | None, int]] = []
+    restored_done = threading.Event()
+
+    async def restored_handler(event):
+        restored_events.append((event.namespace, event.key, event.value, event.expire_ts))
+        restored_done.set()
+
+    await store.register_expiry_callback("on_expire", restored_handler)
+    await asyncio.wait_for(store.wait_for_callbacks(timeout=5), timeout=5)
+    await asyncio.wait_for(asyncio.to_thread(restored_done.wait), timeout=2)
+
+    assert store._count_callback_jobs() == 0
+    assert restored_events
+    assert restored_events[0][1] == "k1"
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_callback_can_explicitly_defer_and_then_resume(tmp_path):
+    store = _make_store(tmp_path)
+    try:
+        await store.register_builtin_callback("on_expire")
+
+        callback_done = threading.Event()
+        attempts = 0
+
+        async def on_expire(_event):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ExpiryCallbackDeferred("service not ready")
+            callback_done.set()
+
+        await store.register_expiry_callback("on_expire", on_expire)
+        await store.set("default", "k1", "v1", retention=1, on_expire="on_expire")
+        await store.cleanup_expired(now=time.time() + 120)
+
+        await asyncio.wait_for(asyncio.to_thread(callback_done.wait), timeout=5)
+        await asyncio.wait_for(store.wait_for_callbacks(timeout=5), timeout=5)
+
+        assert attempts >= 2
+        assert store._count_callback_jobs() == 0
+        assert store._count_dead_letter_callback_jobs() == 0
+    finally:
+        await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_callbacks_can_scope_to_specific_callback(tmp_path):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+    try:
+        callback_done = threading.Event()
+
+        async def on_c1(_event):
+            callback_done.set()
+
+        async def on_c2(_event):
+            raise ExpiryCallbackDeferred("keep pending for scoped wait test")
+
+        await store.register_builtin_callback("c1")
+        await store.register_builtin_callback("c2")
+        await store.register_expiry_callback("c1", on_c1)
+        await store.register_expiry_callback("c2", on_c2)
+        await store.set("default", "k1", "v1", retention=1, on_expire="c1")
+        await store.set("default", "k2", "v2", retention=1, on_expire="c2")
+
+        await store.cleanup_expired(now=time.time() + 120)
+        assert store._count_callback_jobs() == 2
+        assert store._count_callback_jobs_for("c1") == 1
+        assert store._count_callback_jobs_for("c2") == 1
+
+        StoreService._release_file_lock(callback_lock)
+        callback_lock = None
+
+        assert await store.wait_for_callbacks(timeout=5, callback_name="c1")
+        assert callback_done.is_set()
+        assert store._count_callback_jobs() == 1
+        assert store._count_callback_jobs_for("c1") == 0
+        assert store._count_callback_jobs_for("c2") == 1
+    finally:
+        if callback_lock is not None:
+            StoreService._release_file_lock(callback_lock)
+        await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_get_expired_key_queues_callback_without_enqueue_helper(tmp_path, monkeypatch):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    callback_done = threading.Event()
+    callback_keys: list[str] = []
+
+    async def on_expire(event):
+        callback_keys.append(event.key)
+        callback_done.set()
+
+    await store.register_builtin_callback("on_expire")
+    await store.register_expiry_callback("on_expire", on_expire)
+    await store.set("default", "k1", "v1", retention=1, on_expire="on_expire")
+
+    async def fail_enqueue(_events):
+        raise RuntimeError("_enqueue_callbacks should not be called by get() delete path")
+
+    real_time = time.time
+    monkeypatch.setattr(store, "_enqueue_callbacks", fail_enqueue)
+    monkeypatch.setattr(store_main.time, "time", lambda: real_time() + 120)
+
+    try:
+        assert await store.get("default", "k1") is None
+        assert store._count_callback_jobs() == 1
+    finally:
+        StoreService._release_file_lock(callback_lock)
+
+    await asyncio.wait_for(store.wait_for_callbacks(timeout=5), timeout=5)
+    await asyncio.wait_for(asyncio.to_thread(callback_done.wait), timeout=2)
+    assert callback_keys == ["k1"]
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_get_many_expired_key_queues_callback_without_enqueue_helper(
+    tmp_path, monkeypatch
+):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    callback_done = threading.Event()
+    callback_keys: list[str] = []
+
+    async def on_expire(event):
+        callback_keys.append(event.key)
+        callback_done.set()
+
+    await store.register_builtin_callback("on_expire")
+    await store.register_expiry_callback("on_expire", on_expire)
+    await store.set("default", "k1", "v1", retention=1, on_expire="on_expire")
+
+    async def fail_enqueue(_events):
+        raise RuntimeError(
+            "_enqueue_callbacks should not be called by get_many() delete path"
+        )
+
+    real_time = time.time
+    monkeypatch.setattr(store, "_enqueue_callbacks", fail_enqueue)
+    monkeypatch.setattr(store_main.time, "time", lambda: real_time() + 120)
+
+    try:
+        values = await store.get_many("default", ["k1", "missing"])
+        assert values == {"k1": None, "missing": None}
+        assert store._count_callback_jobs() == 1
+        assert store._count_callback_jobs_for("on_expire") == 1
+    finally:
+        StoreService._release_file_lock(callback_lock)
+
+    await asyncio.wait_for(store.wait_for_callbacks(timeout=5), timeout=5)
+    await asyncio.wait_for(asyncio.to_thread(callback_done.wait), timeout=2)
+    assert callback_keys == ["k1"]
+    assert store._count_callback_jobs_for("on_expire") == 0
+
+    await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_expired_queues_callback_without_enqueue_helper(tmp_path, monkeypatch):
+    store = _make_store(tmp_path)
+    callback_lock = StoreService._try_acquire_file_lock(
+        tmp_path / "store_lmdb" / ".store_callbacks.lock"
+    )
+    assert callback_lock is not None
+
+    callback_done = threading.Event()
+
+    async def on_expire(_event):
+        callback_done.set()
+
+    await store.register_builtin_callback("on_expire")
+    await store.register_expiry_callback("on_expire", on_expire)
+    await store.set("default", "k1", "v1", retention=1, on_expire="on_expire")
+
+    async def fail_enqueue(_events):
+        raise RuntimeError("_enqueue_callbacks should not be called by cleanup_expired()")
+
+    monkeypatch.setattr(store, "_enqueue_callbacks", fail_enqueue)
+
+    try:
+        await store.cleanup_expired(now=time.time() + 120)
+        assert store._count_callback_jobs() == 1
+    finally:
+        StoreService._release_file_lock(callback_lock)
+
+    await asyncio.wait_for(store.wait_for_callbacks(timeout=5), timeout=5)
+    await asyncio.wait_for(asyncio.to_thread(callback_done.wait), timeout=2)
+    assert store._count_callback_jobs() == 0
+
+    await store.shutdown()
 
 
 @pytest.mark.asyncio

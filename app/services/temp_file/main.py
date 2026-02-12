@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import errno
 import inspect
-import math
 import os
 import stat
 import threading
@@ -13,22 +12,19 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, ClassVar, Optional
 from urllib.parse import quote
 
 from loguru import logger
 
 from app.services import BaseService
-from app.services.store import ExpiryCallbackEvent, StoreService
+from app.services.store import ExpiryCallbackDeferred, ExpiryCallbackEvent, StoreService
 
 from . import _runtime
-
-_RUNTIME_THREAD_START_TIMEOUT_SECONDS = 5.0
-_RUNTIME_THREAD_STOP_TIMEOUT_SECONDS = 5.0
-_RUNTIME_SUBMIT_TIMEOUT_SECONDS = 30.0
-_RUNTIME_MAX_PENDING_CALLS = 1024
-_RUNTIME_BLOCKING_WAIT_POLL_SECONDS = 0.1
-
+from ._file_ops import TempFileFileOpsMixin
+from ._metadata import TempFileMetadataMixin
+from ._reconciler import TempFileReconcilerMixin
+from ._runtime_dispatch import TempFileRuntimeDispatchMixin
 
 def _new_signaled_event() -> threading.Event:
     event = threading.Event()
@@ -59,7 +55,13 @@ class _SharedTempFileEntry:
     close_done: threading.Event = field(default_factory=_new_signaled_event)
 
 
-class TempFileService(BaseService):
+class TempFileService(
+    TempFileRuntimeDispatchMixin,
+    TempFileMetadataMixin,
+    TempFileReconcilerMixin,
+    TempFileFileOpsMixin,
+    BaseService,
+):
     """
     Temporary file manager.
 
@@ -104,6 +106,10 @@ class TempFileService(BaseService):
         @staticmethod
         async def dtor(instance: "TempFileService") -> None:
             await TempFileService.release_shared(instance)
+
+    # ------------------------------------------------------------------ #
+    # Shared-instance lifecycle                                           #
+    # ------------------------------------------------------------------ #
 
     _shared_instances: ClassVar[dict[str, _SharedTempFileEntry]] = {}
     _shared_instances_lock: ClassVar[threading.Lock] = threading.Lock()
@@ -337,13 +343,7 @@ class TempFileService(BaseService):
         self._cleanup_task: Optional[asyncio.Task] = None
         self._size_recalc_task: Optional[asyncio.Task] = None
         self._cleanup_lock_handle: Any | None = None
-        self._runtime_loop: asyncio.AbstractEventLoop | None = None
-        self._runtime_thread: threading.Thread | None = None
-        self._runtime_thread_id: int | None = None
-        self._runtime_ready = threading.Event()
-        self._runtime_submit_semaphore = threading.BoundedSemaphore(
-            _RUNTIME_MAX_PENDING_CALLS
-        )
+        self._init_runtime_dispatch_state()
         self._closed = False
         self._executor_shutdown = False
         self._shared_registry_managed = False
@@ -412,6 +412,10 @@ class TempFileService(BaseService):
                 )
             )
 
+    # ------------------------------------------------------------------ #
+    # Public service API                                                  #
+    # ------------------------------------------------------------------ #
+
     async def start_cleanup(self) -> None:
         if not self._is_runtime_thread():
             return await self._run_on_runtime_thread(self.start_cleanup)
@@ -457,7 +461,9 @@ class TempFileService(BaseService):
         try:
             try:
                 drained = await self._store.wait_for_callbacks(
-                    timeout=5, raise_on_incomplete=False
+                    timeout=5,
+                    raise_on_incomplete=False,
+                    callback_name=self._callback_name,
                 )
             except Exception:
                 drained = False
@@ -499,7 +505,7 @@ class TempFileService(BaseService):
                     self._write_unique, base_name, data, now
                 )
                 self._total_size_bytes += len(data)
-                await self._set_metadata(
+                await self._write_metadata(
                     saved_name,
                     is_text,
                     self._retention_minutes,
@@ -537,7 +543,7 @@ class TempFileService(BaseService):
         revision = self._new_revision()
         self._assert_size_allowed(len(data), filename=base_name)
         async with self._write_guard:
-            previous_metadata = await self._get_metadata(base_name)
+            previous_metadata = await self._read_metadata(base_name)
             backup_name: str | None = None
             staging_name: str | None = None
             swap_completed = False
@@ -563,7 +569,7 @@ class TempFileService(BaseService):
                     staging_name,
                 )
                 swap_completed = True
-                await self._set_metadata(
+                await self._write_metadata(
                     base_name,
                     is_text,
                     self._retention_minutes,
@@ -647,13 +653,13 @@ class TempFileService(BaseService):
             raise
         now = time.time()
 
-        metadata = await self._resolve_metadata(safe_name, path, data, now)
+        metadata = await self._resolve_or_infer_metadata(safe_name, path, data, now)
         if metadata is None:
             raise FileNotFoundError(safe_name)
         is_text, revision = metadata
 
         await self._run_in_executor(self._touch_file, path, now)
-        await self._set_metadata(
+        await self._write_metadata(
             safe_name,
             is_text,
             self._retention_minutes,
@@ -674,543 +680,8 @@ class TempFileService(BaseService):
         await self._store.cleanup_expired(now)
         await self._reconcile_files(now, adopt_fresh=False)
 
-    async def _set_metadata(
-        self,
-        name: str,
-        is_text: bool,
-        retention_minutes: int,
-        revision: str,
-    ) -> None:
-        payload = self._encode_metadata(is_text, revision)
-        async with self._namespace_lock:
-            await self._store.set(
-                self._namespace,
-                name,
-                payload,
-                retention=retention_minutes,
-                on_expire=self._callback_name,
-            )
-
-    async def _clear_metadata_best_effort(self, name: str) -> None:
-        try:
-            namespace_escaped = self._store._encode_namespace(self._namespace)
-            key_bytes = self._store._encode_key(name)
-            async with self._store._write_lock:
-                await self._store._run_in_executor(
-                    self._store._delete_key,
-                    self._namespace,
-                    namespace_escaped,
-                    key_bytes,
-                    0,
-                )
-        except Exception:
-            logger.exception("[TMP] Failed clearing metadata", name=name)
-
-    async def _restore_metadata_after_overwrite_failure(
-        self,
-        name: str,
-        previous_metadata: tuple[bool, str] | None,
-    ) -> None:
-        path = self._base_dir / name
-        try:
-            if not path.exists() or not path.is_file() or path.is_symlink():
-                await self._clear_metadata_best_effort(name)
-                return
-        except Exception:
-            await self._clear_metadata_best_effort(name)
-            return
-
-        if previous_metadata is None:
-            await self._clear_metadata_best_effort(name)
-            return
-
-        is_text, revision = previous_metadata
-        await self._set_metadata(
-            name,
-            is_text,
-            self._retention_minutes,
-            revision=revision,
-        )
-
-    async def _get_metadata(self, name: str) -> tuple[bool, str] | None:
-        async with self._namespace_lock:
-            value = await self._store.get(self._namespace, name)
-        return self._decode_metadata(value)
-
-    async def _resolve_metadata(
-        self,
-        name: str,
-        path: Path,
-        data: bytes,
-        now: float,
-    ) -> tuple[bool, str] | None:
-        meta = await self._get_metadata(name)
-        if meta is not None:
-            return meta
-
-        try:
-            mtime = await self._run_in_executor(self._get_mtime, path)
-        except Exception:
-            logger.exception("[TMP] Failed to stat temp file", name=name)
-            return None
-
-        if now - mtime >= self._retention_seconds:
-            await self._run_in_executor(self._delete_file, name)
-            return None
-
-        return self._is_utf8(data), self._new_revision()
-
-    async def _adopt_existing_files(self) -> None:
-        now = time.time()
-        await self._reconcile_files(now, adopt_fresh=True)
-
-    async def _reconcile_files(self, now: float, adopt_fresh: bool = True) -> None:
-        entries = await self._run_in_executor(self._scan_files)
-        if not entries:
-            self._total_size_bytes = 0
-            return
-
-        cutoff = now - self._retention_seconds
-        internal_artifact_cutoff = now - self.INTERNAL_ARTIFACT_RETENTION_SECONDS
-        delete_names: list[str] = []
-        delete_internal_names: list[str] = []
-        adopt_entries: list[tuple[str, float]] = []
-
-        current_total = 0
-        async with self._namespace_lock:
-            for name, mtime, size in entries:
-                current_total += size
-                if self._is_internal_artifact_name(name):
-                    if mtime < internal_artifact_cutoff:
-                        delete_internal_names.append(name)
-                    continue
-
-                value = await self._store.get(self._namespace, name)
-                if self._decode_metadata(value) is not None:
-                    continue
-                if mtime < cutoff:
-                    delete_names.append(name)
-                elif adopt_fresh:
-                    adopt_entries.append((name, mtime))
-
-        self._total_size_bytes = current_total
-
-        if delete_internal_names:
-            deleted_internal_size = await self._run_in_executor(
-                self._delete_files,
-                delete_internal_names,
-            )
-            self._total_size_bytes = max(
-                0,
-                self._total_size_bytes - deleted_internal_size,
-            )
-
-        if delete_names:
-            deleted_size = await self._run_in_executor(
-                self._delete_files,
-                delete_names,
-            )
-            self._total_size_bytes = max(
-                0,
-                self._total_size_bytes - deleted_size,
-            )
-
-        for name, mtime in adopt_entries:
-            path = self._base_dir / name
-            try:
-                data = await self._run_in_executor(self._read_file_bytes, path)
-            except Exception:
-                logger.exception("[TMP] Failed to read temp file", name=name)
-                continue
-            is_text = self._is_utf8(data)
-            remaining = max(1, math.ceil(
-                (self._retention_seconds - (now - mtime)) / 60))
-            try:
-                await self._set_metadata(
-                    name,
-                    is_text,
-                    remaining,
-                    revision=self._new_revision(),
-                )
-            except Exception:
-                logger.exception(
-                    "[TMP] Failed to adopt temp file metadata", name=name)
-                continue
-
-    async def _on_expire(self, event: ExpiryCallbackEvent) -> None:
-        if not self._is_runtime_thread():
-            if self._closed:
-                logger.debug(
-                    "[TMP] Skipping expiry callback after service close", key=event.key
-                )
-                return
-            await self._run_on_runtime_thread(self._on_expire, event)
-            return
-        if self._executor_shutdown:
-            logger.debug(
-                "[TMP] Skipping expiry callback after shutdown", key=event.key)
-            return
-        try:
-            path = self._base_dir / event.key
-            if path.parent != self._base_dir:
-                logger.warning(
-                    "[TMP] Expiry callback skipped key outside temp dir",
-                    key=event.key,
-                )
-                return
-            try:
-                mtime = await self._run_in_executor(self._get_mtime, path)
-            except FileNotFoundError:
-                return
-            except ValueError:
-                logger.warning(
-                    "[TMP] Expiry callback skipped non-regular file", key=event.key
-                )
-                return
-
-            if event.expire_ts > 0 and mtime > float(event.expire_ts):
-                logger.debug(
-                    "[TMP] Skipping stale expiry callback for newer temp file",
-                    key=event.key,
-                    expire_ts=event.expire_ts,
-                    mtime=mtime,
-                )
-                return
-
-            event_metadata = self._decode_metadata(event.value)
-            expected_revision = event_metadata[1] if event_metadata is not None else None
-            if expected_revision is not None:
-                current_meta = await self._get_metadata(event.key)
-                if current_meta is not None:
-                    _, current_revision = current_meta
-                    if current_revision != expected_revision:
-                        logger.debug(
-                            "[TMP] Skipping stale expiry callback due to revision mismatch",
-                            key=event.key,
-                            expected_revision=expected_revision,
-                            current_revision=current_revision,
-                        )
-                        return
-
-            deleted_size = await self._run_in_executor(self._delete_file, event.key)
-            self._total_size_bytes -= deleted_size
-        except Exception:
-            logger.exception("[TMP] Expiry callback failed", key=event.key)
-
-    def _sanitize_filename(self, filename: str) -> str:
-        if not filename or filename.strip() == "":
-            raise ValueError("Filename must be non-empty")
-        filename = self._encode_filename(filename)
-        if filename.startswith("."):
-            filename = self._escape_leading_dots(filename)
-        return filename
-
-    def _normalize_content(self, content: str | bytes | bytearray | memoryview) -> tuple[bool, bytes]:
-        if isinstance(content, str):
-            return True, content.encode("utf-8")
-        if isinstance(content, memoryview):
-            return False, content.tobytes()
-        if isinstance(content, (bytes, bytearray)):
-            return False, bytes(content)
-        raise TypeError("Content must be str or bytes-like")
-
-    def _write_unique(self, base_name: str, data: bytes, now: float) -> str:
-        base_path = self._base_dir / base_name
-        stem = base_path.stem
-        suffix = base_path.suffix
-
-        attempt = 0
-        while True:
-            if attempt == 0:
-                candidate = base_name
-            else:
-                candidate = (
-                    f"{stem}.{attempt}{suffix}"
-                    if suffix
-                    else f"{base_name}.{attempt}"
-                )
-
-            path = self._base_dir / candidate
-            try:
-                self._write_new_file(path, data)
-                self._touch_file(path, now)
-                return candidate
-            except FileExistsError:
-                attempt += 1
-                continue
-            except Exception:
-                # Best-effort cleanup if file was created
-                try:
-                    if path.exists():
-                        path.unlink()
-                except Exception:
-                    logger.exception("[TMP] Failed to remove partial file")
-                raise
-
-    @classmethod
-    def _new_staging_name(cls, base_name: str) -> str:
-        safe_base = quote(base_name, safe="")
-        return f"{cls.INTERNAL_STAGING_PREFIX}{safe_base}.{uuid.uuid4().hex}"
-
-    @classmethod
-    def _new_backup_name(cls, base_name: str) -> str:
-        safe_base = quote(base_name, safe="")
-        return f"{cls.INTERNAL_BACKUP_PREFIX}{safe_base}.{uuid.uuid4().hex}"
-
-    @classmethod
-    def _is_internal_artifact_name(cls, name: str) -> bool:
-        if name.startswith(cls.INTERNAL_STAGING_PREFIX):
-            return True
-        if name.startswith(cls.INTERNAL_BACKUP_PREFIX):
-            return True
-        # Backward compatibility: clean legacy artifact names produced before the
-        # internal-prefix migration.
-        if name.startswith(".") and (".staging." in name or ".bak." in name):
-            return True
-        return False
-
-    def _write_staging_file(self, staging_name: str, data: bytes, now: float) -> None:
-        path = self._base_dir / staging_name
-        try:
-            self._write_new_file(path, data)
-            self._touch_file(path, now)
-        except Exception:
-            try:
-                st = path.lstat()
-                if stat.S_ISREG(st.st_mode):
-                    path.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                logger.exception("[TMP] Failed to remove partial staging file")
-            raise
-
-    def _swap_staged_overwrite(self, base_name: str, staging_name: str) -> str | None:
-        path = self._base_dir / base_name
-        staging_path = self._base_dir / staging_name
-        backup_name: str | None = None
-        backup_path: Path | None = None
-        backup_moved = False
-        try:
-            try:
-                st = path.lstat()
-            except FileNotFoundError:
-                st = None
-            if st is not None:
-                if stat.S_ISLNK(st.st_mode):
-                    raise ValueError(
-                        f"Refusing to overwrite symlink temp file: {base_name}"
-                    )
-                if not stat.S_ISREG(st.st_mode):
-                    raise ValueError(f"Path is not a regular file: {base_name}")
-                backup_name = self._new_backup_name(base_name)
-                backup_path = self._base_dir / backup_name
-                os.replace(path, backup_path)
-                backup_moved = True
-
-            os.replace(staging_path, path)
-            self._tighten_file_permissions(path)
-            return backup_name
-        except Exception:
-            try:
-                st = staging_path.lstat()
-                if stat.S_ISREG(st.st_mode):
-                    staging_path.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                logger.exception("[TMP] Failed to remove staging file")
-            if backup_moved and backup_path is not None:
-                try:
-                    os.replace(backup_path, path)
-                    self._tighten_file_permissions(path)
-                except Exception:
-                    logger.exception(
-                        "[TMP] Failed to restore backup after overwrite swap failure",
-                        name=base_name,
-                    )
-            raise
-
-    def _rollback_overwrite_after_metadata_failure(
-        self,
-        base_name: str,
-        backup_name: str | None,
-    ) -> int:
-        """Rollback failed overwrite by deleting file and restoring backup.
-
-        Returns:
-            The size of the file that was deleted (0 if no file was deleted).
-        """
-        path = self._base_dir / base_name
-        if backup_name is None:
-            return self._delete_file(base_name)
-
-        backup_path = self._base_dir / backup_name
-        deleted_size = 0
-        try:
-            st = path.lstat()
-        except FileNotFoundError:
-            st = None
-        if st is not None:
-            if stat.S_ISLNK(st.st_mode):
-                raise ValueError(
-                    f"Refusing rollback on symlink temp file: {base_name}"
-                )
-            if not stat.S_ISREG(st.st_mode):
-                raise ValueError(f"Path is not a regular file: {base_name}")
-            deleted_size = st.st_size
-            path.unlink()
-        os.replace(backup_path, path)
-        self._tighten_file_permissions(path)
-        return deleted_size
-
-    def _discard_backup_file(self, backup_name: str | None) -> int:
-        if not backup_name:
-            return 0
-        return self._delete_file(backup_name)
-
-    def _touch_file(self, path: Path, now: float) -> None:
-        st = path.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise ValueError(f"Refusing to touch symlink temp file: {path.name}")
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"Path is not a regular file: {path.name}")
-        os.utime(path, (now, now))
-
-    def _delete_file(self, name: str) -> int:
-        path = self._base_dir / name
-        try:
-            st = path.lstat()
-            if stat.S_ISLNK(st.st_mode):
-                logger.warning(
-                    "[TMP] Refusing to delete symlink temp file", name=name
-                )
-                return 0
-            if stat.S_ISREG(st.st_mode):
-                size = st.st_size
-                path.unlink()
-                return size
-        except FileNotFoundError:
-            pass
-        return 0
-
-    def _delete_files(self, names: list[str]) -> int:
-        deleted_size = 0
-        for name in names:
-            try:
-                deleted_size += self._delete_file(name)
-            except Exception:
-                logger.exception("[TMP] Failed to delete file", name=name)
-        return deleted_size
-
-    def _scan_files(self) -> list[tuple[str, float, int]]:
-        entries: list[tuple[str, float, int]] = []
-        lock_name = self._cleanup_lock_path().name
-        try:
-            for path in self._base_dir.iterdir():
-                if path.name == lock_name:
-                    continue
-                try:
-                    st = path.lstat()
-                except Exception:
-                    logger.exception(
-                        "[TMP] Failed to stat file", name=path.name)
-                    continue
-                if stat.S_ISLNK(st.st_mode):
-                    logger.warning(
-                        "[TMP] Ignoring symlink in temp dir", name=path.name)
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                mtime = st.st_mtime
-                size = st.st_size
-                entries.append((path.name, mtime, size))
-        except Exception:
-            logger.exception("[TMP] Failed scanning temp dir")
-        return entries
-
-    @staticmethod
-    def _get_mtime(path: Path) -> float:
-        st = path.lstat()
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"Path is not a regular file: {path.name}")
-        return st.st_mtime
-
-    @staticmethod
-    def _get_size_bytes(path: Path) -> int:
-        st = path.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise ValueError(f"Path is symlink: {path.name}")
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"Path is not a regular file: {path.name}")
-        return st.st_size
-
-    def _cleanup_lock_path(self) -> Path:
-        return self._base_dir / ".tmp_cleanup.lock"
-
-    @staticmethod
-    def _encode_filename(name: str) -> str:
-        # Encode Windows/Linux-invalid characters + '%' to avoid collisions.
-        invalid_chars = set('<>:"/\\|?*%')
-
-        parts: list[str] = []
-        for ch in name:
-            code = ord(ch)
-            if ch in invalid_chars or code == 0 or code < 32 or code == 127:
-                parts.append(TempFileService._pct_encode_char(ch))
-            else:
-                parts.append(ch)
-        encoded = "".join(parts)
-
-        # Encode trailing spaces/dots (invalid on Windows).
-        i = len(encoded)
-        while i > 0 and encoded[i - 1] in (" ", "."):
-            i -= 1
-        if i != len(encoded):
-            trailing = encoded[i:]
-            encoded = encoded[:i] + "".join(
-                TempFileService._pct_encode_char(ch) for ch in trailing
-            )
-
-        # Encode Windows reserved device names (case-insensitive), e.g. CON, PRN, AUX, NUL, COM1-9, LPT1-9.
-        base, dot, ext = encoded.partition(".")
-        base_stripped = base.rstrip(" .")
-        upper_base = base_stripped.upper()
-        if TempFileService._is_windows_reserved_name(upper_base):
-            encoded_base = "".join(
-                TempFileService._pct_encode_char(ch) for ch in base)
-            encoded = encoded_base + (dot + ext if dot else "")
-
-        return encoded
-
-    @staticmethod
-    def _pct_encode_char(ch: str) -> str:
-        return "".join(f"%{b:02X}" for b in ch.encode("utf-8"))
-
-    @staticmethod
-    def _is_windows_reserved_name(name: str) -> bool:
-        if name in {"CON", "PRN", "AUX", "NUL"}:
-            return True
-        if len(name) == 4 and name[:3] in {"COM", "LPT"} and name[3].isdigit():
-            return name[3] != "0"
-        return False
-
-    @staticmethod
-    def _escape_leading_dots(name: str) -> str:
-        i = 0
-        while i < len(name) and name[i] == ".":
-            i += 1
-        if i == 0:
-            return name
-        return "%2E" * i + name[i:]
-
-    @staticmethod
-    def _is_utf8(data: bytes) -> bool:
-        try:
-            data.decode("utf-8")
-            return True
-        except UnicodeDecodeError:
-            return False
+    # Metadata/reconcile/file operations are provided by mixins:
+    # TempFileMetadataMixin, TempFileReconcilerMixin, TempFileFileOpsMixin.
 
     @staticmethod
     def _validate_config(config: TempFileConfig) -> None:
@@ -1335,156 +806,6 @@ class TempFileService(BaseService):
     def _assert_open(self) -> None:
         if self._closed:
             raise RuntimeError("TempFileService is closed")
-
-    async def _run_in_executor(self, fn, *args, **kwargs):
-        return await _runtime.run_in_executor(self._executor, fn, *args, **kwargs)
-
-    async def _await_cancellable_thread_call(
-        self,
-        fn: Callable[[threading.Event], Any],
-    ) -> Any:
-        cancel_event = threading.Event()
-        waiter = asyncio.create_task(asyncio.to_thread(fn, cancel_event))
-        try:
-            return await waiter
-        except asyncio.CancelledError:
-            cancel_event.set()
-            try:
-                await waiter
-            except Exception:
-                logger.exception("[TMP] Cancellation cleanup for thread wait failed")
-            raise
-
-    def _acquire_runtime_submit_slot(
-        self,
-        cancel_event: threading.Event,
-    ) -> bool:
-        deadline = time.monotonic() + _RUNTIME_SUBMIT_TIMEOUT_SECONDS
-        while not cancel_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            wait_seconds = min(_RUNTIME_BLOCKING_WAIT_POLL_SECONDS, remaining)
-            acquired = self._runtime_submit_semaphore.acquire(timeout=wait_seconds)
-            if not acquired:
-                continue
-            if cancel_event.is_set():
-                self._runtime_submit_semaphore.release()
-                return False
-            return True
-        return False
-
-    def _make_runtime_submit_releaser(self) -> Callable[[object], None]:
-        released = False
-        released_lock = threading.Lock()
-
-        def _release_slot(_fut: object = None) -> None:
-            nonlocal released
-            with released_lock:
-                if released:
-                    return
-                released = True
-            self._runtime_submit_semaphore.release()
-
-        return _release_slot
-
-    def _is_runtime_thread(self) -> bool:
-        return self._runtime_thread_id == threading.get_ident()
-
-    def _start_runtime_thread(self) -> None:
-        if self._runtime_thread is not None:
-            return
-        self._runtime_ready.clear()
-        self._runtime_thread = threading.Thread(
-            target=self._runtime_thread_main,
-            name="temp-file-runtime",
-            daemon=True,
-        )
-        self._runtime_thread.start()
-        if not self._runtime_ready.wait(timeout=_RUNTIME_THREAD_START_TIMEOUT_SECONDS):
-            loop = self._runtime_loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(loop.stop)
-            self._runtime_thread.join(timeout=_RUNTIME_THREAD_STOP_TIMEOUT_SECONDS)
-            if self._runtime_thread.is_alive():
-                raise RuntimeError(
-                    "TempFileService runtime thread failed to start and could not be stopped"
-                )
-            self._runtime_thread = None
-            self._runtime_loop = None
-            self._runtime_thread_id = None
-            raise RuntimeError(
-                "TempFileService runtime thread did not start within timeout"
-            )
-        if self._runtime_loop is None:
-            raise RuntimeError("TempFileService runtime thread failed to start")
-
-    def _runtime_thread_main(self) -> None:
-        loop = asyncio.new_event_loop()
-        self._runtime_loop = loop
-        self._runtime_thread_id = threading.get_ident()
-        asyncio.set_event_loop(loop)
-        self._runtime_ready.set()
-        try:
-            loop.run_forever()
-        finally:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            asyncio.set_event_loop(None)
-            loop.close()
-            self._runtime_loop = None
-            self._runtime_thread_id = None
-
-    async def _run_on_runtime_thread(self, fn, *args, **kwargs):
-        if self._is_runtime_thread():
-            return await fn(*args, **kwargs)
-        loop = self._runtime_loop
-        if loop is None:
-            if self._closed:
-                raise RuntimeError("TempFileService is closed")
-            raise RuntimeError("TempFileService runtime loop is unavailable")
-        acquired = await self._await_cancellable_thread_call(
-            self._acquire_runtime_submit_slot
-        )
-        if not acquired:
-            raise TimeoutError("TempFileService runtime queue is saturated")
-
-        release_slot = self._make_runtime_submit_releaser()
-
-        try:
-            coro = fn(*args, **kwargs)
-        except Exception:
-            release_slot()
-            raise
-        if not inspect.isawaitable(coro):
-            release_slot()
-            raise TypeError("Runtime-dispatched function must return an awaitable")
-        try:
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
-        except Exception:
-            coro.close()
-            release_slot()
-            raise
-        future.add_done_callback(release_slot)
-        return await asyncio.wrap_future(future)
-
-    async def _stop_runtime_thread(self) -> None:
-        thread = self._runtime_thread
-        loop = self._runtime_loop
-        if thread is None:
-            return
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
-        await asyncio.to_thread(thread.join, _RUNTIME_THREAD_STOP_TIMEOUT_SECONDS)
-        if thread.is_alive():
-            raise RuntimeError("TempFileService runtime thread did not stop in time")
-        self._runtime_thread = None
 
     @staticmethod
     def _try_acquire_file_lock(path: Path) -> Any | None:
