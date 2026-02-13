@@ -79,6 +79,8 @@ Use `.env.production_example` and `.env.debug_example` as starting points.
 | `TMP_MAX_TOTAL_SIZE_MB` | int | `0` | Max total size of temp dir (`0` means unlimited) |
 | `TMP_TOTAL_SIZE_RECALC_SECONDS` | int | `3600` | Total-size recalc interval in seconds (`>= 60`, used only when total-size cap is enabled) |
 | `DATABASE__main__URL` | string | `mysql+aiomysql://root:password@127.0.0.1:3306/app_db` | Async SQLAlchemy URL |
+| `DATABASE__main__POOL_TIMEOUT` | int | `30` | Connection checkout timeout (seconds) |
+| `DATABASE__main__POOL_USE_LIFO` | bool | `false` | Use LIFO strategy for connection pool |
 | `STORE_LMDB__PATH` | string | `./store_lmdb` | LMDB store path |
 | `STORE_LMDB__CALLBACK_WORKER_THREADS` | int | `4` | Store expiry-callback fixed thread-pool size |
 | `STORE_LMDB__MAX_DBS` | int | `256` | Must be `>= 0` (`0` disables user-namespace quota) |

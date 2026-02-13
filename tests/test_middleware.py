@@ -7,10 +7,10 @@ import pytest
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
-from starlette.requests import Request
-from starlette.responses import Response
+from starlette.types import Message
 
 from app.core.dependencies import (
+    REQUEST_FAILED_STATE_KEY,
     Inject,
     ServiceContainer,
     ServiceLifetime,
@@ -76,7 +76,11 @@ class TestRequestLoggingMiddleware:
 
     @pytest.mark.asyncio
     async def test_request_id_context_is_reset_after_dispatch(self):
-        middleware = RequestLoggingMiddleware(app=lambda scope, receive, send: None)
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+        middleware = RequestLoggingMiddleware(app=app)
         scope = {
             "type": "http",
             "http_version": "1.1",
@@ -87,20 +91,182 @@ class TestRequestLoggingMiddleware:
             "client": ("127.0.0.1", 12345),
             "server": ("testserver", 80),
             "scheme": "http",
+            "state": {},
         }
-        request = Request(scope)
+        request_messages = [
+            {"type": "http.request", "body": b"", "more_body": False},
+        ]
+        response_messages: list[Message] = []
 
         seed = request_id_ctx.set("outer-scope")
         try:
-            async def call_next(_request):
-                return Response(content="ok")
+            async def receive():
+                if request_messages:
+                    return request_messages.pop(0)
+                return {"type": "http.disconnect"}
 
-            response = await middleware.dispatch(request, call_next)
+            async def send(message: Message):
+                response_messages.append(message)
 
-            assert response.status_code == 200
+            await middleware(scope, receive, send)
             assert request_id_ctx.get() == "outer-scope"
+            assert scope["state"]["request_id"] == "ctx-reset-id"
+
+            response_start = next(
+                msg for msg in response_messages if msg["type"] == "http.response.start"
+            )
+            headers = dict(response_start["headers"])
+            assert headers[b"x-request-id"] == b"ctx-reset-id"
         finally:
             request_id_ctx.reset(seed)
+
+    @pytest.mark.asyncio
+    async def test_failed_request_completion_logs_warning(self, monkeypatch):
+        records: list[tuple[str, str, dict[str, object] | None]] = []
+
+        def _capture(level: str):
+            def _log(message: str, *args, extra=None, **kwargs):
+                _ = args, kwargs
+                records.append((level, message, extra))
+
+            return _log
+
+        monkeypatch.setattr("app.middleware.logging.logger.info", _capture("info"))
+        monkeypatch.setattr("app.middleware.logging.logger.warning", _capture("warning"))
+        monkeypatch.setattr("app.middleware.logging.logger.error", _capture("error"))
+
+        async def app(scope, receive, send):
+            scope["state"][REQUEST_FAILED_STATE_KEY] = True
+            await send({"type": "http.response.start", "status": 422, "headers": []})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        middleware = RequestLoggingMiddleware(app=app)
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/api/",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "state": {},
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message: Message):
+            return None
+
+        await middleware(scope, receive, send)
+
+        failure_records = [r for r in records if r[1] == "Request failed: GET /api/"]
+        assert len(failure_records) == 1
+        level, _, extra = failure_records[0]
+        assert level == "warning"
+        assert extra is not None
+        assert extra["status_code"] == 422
+        assert extra["request_failed"] is True
+
+    @pytest.mark.asyncio
+    async def test_server_error_completion_logs_error(self, monkeypatch):
+        records: list[tuple[str, str, dict[str, object] | None]] = []
+
+        def _capture(level: str):
+            def _log(message: str, *args, extra=None, **kwargs):
+                _ = args, kwargs
+                records.append((level, message, extra))
+
+            return _log
+
+        monkeypatch.setattr("app.middleware.logging.logger.info", _capture("info"))
+        monkeypatch.setattr("app.middleware.logging.logger.warning", _capture("warning"))
+        monkeypatch.setattr("app.middleware.logging.logger.error", _capture("error"))
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 500, "headers": []})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        middleware = RequestLoggingMiddleware(app=app)
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/api/",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "state": {},
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message: Message):
+            return None
+
+        await middleware(scope, receive, send)
+
+        failure_records = [r for r in records if r[1] == "Request failed: GET /api/"]
+        assert len(failure_records) == 1
+        level, _, extra = failure_records[0]
+        assert level == "error"
+        assert extra is not None
+        assert extra["status_code"] == 500
+        assert extra["request_failed"] is True
+
+    @pytest.mark.asyncio
+    async def test_successful_request_completion_logs_info(self, monkeypatch):
+        records: list[tuple[str, str, dict[str, object] | None]] = []
+
+        def _capture(level: str):
+            def _log(message: str, *args, extra=None, **kwargs):
+                _ = args, kwargs
+                records.append((level, message, extra))
+
+            return _log
+
+        monkeypatch.setattr("app.middleware.logging.logger.info", _capture("info"))
+        monkeypatch.setattr("app.middleware.logging.logger.warning", _capture("warning"))
+        monkeypatch.setattr("app.middleware.logging.logger.error", _capture("error"))
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        middleware = RequestLoggingMiddleware(app=app)
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/api/",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "state": {},
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message: Message):
+            return None
+
+        await middleware(scope, receive, send)
+
+        completed_records = [r for r in records if r[1] == "Request completed: GET /api/"]
+        assert len(completed_records) == 1
+        level, _, extra = completed_records[0]
+        assert level == "info"
+        assert extra is not None
+        assert extra["status_code"] == 200
+        assert extra["request_failed"] is False
 
 
 class TestTransientServiceFinalizerMiddleware:

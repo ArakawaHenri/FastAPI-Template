@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -23,7 +22,6 @@ class DatabaseEngineService(BaseService):
     Async database engine service with connection pooling.
 
     Registered as a singleton; the engine is disposed on shutdown.
-    Use `get_session()` context manager for transactional operations.
     """
 
     @classmethod
@@ -32,15 +30,19 @@ class DatabaseEngineService(BaseService):
         url: str,
         pool_size: int = 5,
         max_overflow: int = 10,
+        pool_timeout: int = 30,
         pool_recycle: int = 3600,
         pool_pre_ping: bool = True,
+        pool_use_lifo: bool = False,
     ) -> DatabaseEngineService:
         return cls(
             url=url,
             pool_size=pool_size,
             max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
             pool_recycle=pool_recycle,
             pool_pre_ping=pool_pre_ping,
+            pool_use_lifo=pool_use_lifo,
         )
 
     @classmethod
@@ -54,8 +56,10 @@ class DatabaseEngineService(BaseService):
         url: str,
         pool_size: int = 5,
         max_overflow: int = 10,
+        pool_timeout: int = 30,
         pool_recycle: int = 3600,
-        pool_pre_ping: bool = True
+        pool_pre_ping: bool = True,
+        pool_use_lifo: bool = False,
     ) -> None:
         if not url:
             raise ValueError("Invalid database URL: empty")
@@ -69,16 +73,20 @@ class DatabaseEngineService(BaseService):
         self.url = url
         self.pool_size = pool_size
         self.max_overflow = max_overflow
+        self.pool_timeout = pool_timeout
         self.pool_recycle = pool_recycle
         self.pool_pre_ping = pool_pre_ping
+        self.pool_use_lifo = pool_use_lifo
         self.db_name = db_name
 
         self.engine: AsyncEngine = create_async_engine(
             self.url,
             pool_size=self.pool_size,
             max_overflow=self.max_overflow,
+            pool_timeout=self.pool_timeout,
             pool_recycle=self.pool_recycle,
             pool_pre_ping=self.pool_pre_ping,
+            pool_use_lifo=self.pool_use_lifo,
             echo=False,
         )
         self.async_sessionmaker = async_sessionmaker(
@@ -88,19 +96,6 @@ class DatabaseEngineService(BaseService):
         )
 
         logger.debug("[DB] Database engine created", db_name=self.db_name)
-
-    @asynccontextmanager
-    async def get_session(self) -> AsyncIterator[AsyncSession]:
-        """Get a database session with automatic commit/rollback."""
-        async with self.async_sessionmaker() as session:
-            try:
-                yield session
-            except Exception:
-                await session.rollback()
-                logger.exception("Database transaction failed")
-                raise
-            else:
-                await session.commit()
 
     async def is_healthy(self) -> bool:
         """Check if the database connection is healthy."""

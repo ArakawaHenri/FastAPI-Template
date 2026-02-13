@@ -9,8 +9,10 @@ class DatabaseSettings(BaseModel):
     url: str
     pool_size: int = 5
     max_overflow: int = 10
+    pool_timeout: int = 30
     pool_recycle: int = 3600  # Connection recycle time (seconds)
     pool_pre_ping: bool = True  # Check connection validity before use
+    pool_use_lifo: bool = False
 
 
 class StoreLMDBSettings(BaseModel):
