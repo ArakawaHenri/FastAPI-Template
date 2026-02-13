@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
-from typing import AsyncIterator
 
 import pytest
 from starlette.requests import Request

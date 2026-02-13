@@ -5,15 +5,17 @@ import contextvars
 import inspect
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
 )
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import ClassVar
 
 import zlmdb.lmdb as lmdb
+from filelock import FileLock
 from loguru import logger
 
 from app.core.settings import settings
@@ -85,8 +87,8 @@ class StoreConfig:
 
 @dataclass
 class _SharedStoreEntry:
-    instance: "StoreService"
-    signature: tuple[Any, ...]
+    instance: StoreService
+    signature: tuple[object, ...]
     ref_count: int = 1
     closing: bool = False
     close_done: threading.Event = field(default_factory=_new_signaled_event)
@@ -126,7 +128,7 @@ class StoreService(
             max_value_bytes: int = settings.store_lmdb.max_value_bytes,
             cleanup_max_deletes: int = settings.store_lmdb.cleanup_max_deletes,
             worker_threads: int = settings.store_lmdb.callback_worker_threads,
-        ) -> "StoreService":
+        ) -> StoreService:
             store = await StoreService.acquire_shared(
                 StoreConfig(
                     path=path,
@@ -150,7 +152,7 @@ class StoreService(
             return store
 
         @staticmethod
-        async def dtor(instance: "StoreService") -> None:
+        async def dtor(instance: StoreService) -> None:
             await StoreService.release_shared(instance)
 
     # ------------------------------------------------------------------ #
@@ -167,7 +169,7 @@ class StoreService(
         return str(data_path.resolve())
 
     @staticmethod
-    def _shared_store_signature(config: StoreConfig) -> tuple[Any, ...]:
+    def _shared_store_signature(config: StoreConfig) -> tuple[object, ...]:
         return (
             config.map_size_mb,
             config.map_size_growth_factor,
@@ -189,8 +191,8 @@ class StoreService(
     def _try_reuse_shared_locked(
         cls,
         key: str,
-        signature: tuple[Any, ...],
-    ) -> tuple["StoreService" | None, threading.Event | None]:
+        signature: tuple[object, ...],
+    ) -> tuple[StoreService | None, threading.Event | None]:
         entry = cls._shared_instances.get(key)
         if entry is None:
             return None, None
@@ -211,9 +213,9 @@ class StoreService(
     def _register_new_shared_locked(
         cls,
         key: str,
-        signature: tuple[Any, ...],
+        signature: tuple[object, ...],
         config: StoreConfig,
-    ) -> "StoreService":
+    ) -> StoreService:
         instance = cls(config)
         instance._shared_registry_managed = True
         instance._shared_instance_key = key
@@ -228,7 +230,7 @@ class StoreService(
     def _release_shared_locked(
         cls,
         key: str,
-        instance: "StoreService",
+        instance: StoreService,
     ) -> tuple[bool, bool, _SharedStoreEntry | None]:
         entry = cls._shared_instances.get(key)
         if entry is None or entry.instance is not instance:
@@ -245,7 +247,7 @@ class StoreService(
         return (True, False, entry)
 
     @classmethod
-    async def acquire_shared(cls, config: StoreConfig) -> "StoreService":
+    async def acquire_shared(cls, config: StoreConfig) -> StoreService:
         key = cls._shared_store_key(config.path)
         signature = cls._shared_store_signature(config)
         while True:
@@ -259,7 +261,7 @@ class StoreService(
             await asyncio.to_thread(waiter.wait)
 
     @classmethod
-    async def release_shared(cls, instance: "StoreService") -> None:
+    async def release_shared(cls, instance: StoreService) -> None:
         if not getattr(instance, "_shared_registry_managed", False):
             await instance.shutdown()
             return
@@ -388,21 +390,21 @@ class StoreService(
             max_workers=config.worker_threads,
             thread_name_prefix="store-callback-runner",
         )
-        self._callback_future: Future[Any] | None = None
+        self._callback_future: Future[None] | None = None
         self._callback_guard = contextvars.ContextVar(
             "store_callback_guard", default=False)
         self._callback_dispatch_stop = threading.Event()
         self._callback_wakeup = threading.Event()
         self._callback_active = threading.Event()
-        self._callback_lock_handle = None
+        self._callback_lock_handle: FileLock | None = None
         self._callback_log_throttler = CallbackLogThrottler(
             window_seconds=_CALLBACK_LOG_THROTTLE_SECONDS
         )
         self._callback_count_index_needs_rebuild = self._is_callback_count_index_stale()
 
         self._cleanup_stop = asyncio.Event()
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self._cleanup_lock_handle = None
+        self._cleanup_task: asyncio.Task | None = None
+        self._cleanup_lock_handle: FileLock | None = None
         self._init_runtime_dispatch_state()
         self._closed = False
         self._shared_registry_managed = False
@@ -679,7 +681,7 @@ class StoreService(
         namespace: str = "default",
         key: str = "",
         value: object = "",
-        retention: Optional[int] = None,
+        retention: int | None = None,
         on_expire: str | None = None,
     ) -> None:
         if not self._is_runtime_thread():
@@ -739,7 +741,7 @@ class StoreService(
                              namespace=namespace, key=key)
             raise
 
-    async def get(self, namespace: str = "default", key: str = "") -> Optional[object]:
+    async def get(self, namespace: str = "default", key: str = "") -> object | None:
         if not self._is_runtime_thread():
             return await self._run_on_runtime_thread(self.get, namespace, key)
         self._assert_open()
@@ -835,7 +837,7 @@ class StoreService(
                 self._callback_wakeup.set()
         return values
 
-    async def cleanup_expired(self, now: Optional[float] = None) -> None:
+    async def cleanup_expired(self, now: float | None = None) -> None:
         if not self._is_runtime_thread():
             return await self._run_on_runtime_thread(self.cleanup_expired, now)
         self._assert_open()
@@ -1049,11 +1051,11 @@ class StoreService(
             )
 
     @staticmethod
-    def _try_acquire_file_lock(path: Path) -> Any | None:
+    def _try_acquire_file_lock(path: Path) -> FileLock | None:
         return _runtime.try_acquire_file_lock(path)
 
     @staticmethod
-    def _release_file_lock(handle: Any | None) -> None:
+    def _release_file_lock(handle: FileLock | None) -> None:
         _runtime.release_file_lock(handle)
 
     @staticmethod
@@ -1067,7 +1069,7 @@ class StoreService(
     async def _cleanup_loop(
         self,
         name: str,
-        cleanup_fn,
+        cleanup_fn: Callable[[float], Awaitable[None]],
         stop_event: asyncio.Event,
         interval_seconds: int = 60,
     ) -> None:

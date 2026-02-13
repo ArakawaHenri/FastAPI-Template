@@ -4,7 +4,8 @@ import asyncio
 import inspect
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Awaitable, Callable
+from typing import ParamSpec, TypeVar
 
 from loguru import logger
 
@@ -15,6 +16,8 @@ _RUNTIME_THREAD_STOP_TIMEOUT_SECONDS = 5.0
 _RUNTIME_SUBMIT_TIMEOUT_SECONDS = 30.0
 _RUNTIME_MAX_PENDING_CALLS = 1024
 _RUNTIME_BLOCKING_WAIT_POLL_SECONDS = 0.1
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 
 
 class TempFileRuntimeDispatchMixin:
@@ -27,13 +30,18 @@ class TempFileRuntimeDispatchMixin:
             _RUNTIME_MAX_PENDING_CALLS
         )
 
-    async def _run_in_executor(self, fn, *args, **kwargs):
+    async def _run_in_executor(
+        self,
+        fn: Callable[_P, _T],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _T:
         return await _runtime.run_in_executor(self._executor, fn, *args, **kwargs)
 
     async def _await_cancellable_thread_call(
         self,
-        fn: Callable[[threading.Event], Any],
-    ) -> Any:
+        fn: Callable[[threading.Event], _T],
+    ) -> _T:
         cancel_event = threading.Event()
         waiter = asyncio.create_task(asyncio.to_thread(fn, cancel_event))
         try:
@@ -65,11 +73,11 @@ class TempFileRuntimeDispatchMixin:
             return True
         return False
 
-    def _make_runtime_submit_releaser(self) -> Callable[[object], None]:
+    def _make_runtime_submit_releaser(self) -> Callable[[object | None], None]:
         released = False
         released_lock = threading.Lock()
 
-        def _release_slot(_fut: object = None) -> None:
+        def _release_slot(_fut: object | None = None) -> None:
             nonlocal released
             with released_lock:
                 if released:
@@ -132,7 +140,12 @@ class TempFileRuntimeDispatchMixin:
             self._runtime_loop = None
             self._runtime_thread_id = None
 
-    async def _run_on_runtime_thread(self, fn, *args, **kwargs):
+    async def _run_on_runtime_thread(
+        self,
+        fn: Callable[_P, Awaitable[_T]],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _T:
         if self._is_runtime_thread():
             return await fn(*args, **kwargs)
         loop = self._runtime_loop

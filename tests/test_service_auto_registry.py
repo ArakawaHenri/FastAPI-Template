@@ -32,14 +32,14 @@ def test_service_dict_expansion_and_require_placeholder_resolution(
     class SharedDepService(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor() -> "SharedDepService":
+            async def ctor() -> SharedDepService:
                 return SharedDepService()
 
     @ServiceDict("root_service", dict={"alpha": {"name": "a"}, "beta": {"name": "b"}})
     class RootService(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor(name: str) -> "RootService":
+            async def ctor(name: str) -> RootService:
                 _ = name
                 return RootService()
 
@@ -50,7 +50,7 @@ def test_service_dict_expansion_and_require_placeholder_resolution(
             async def ctor(
                 shared=require("shared_dep"),
                 scoped=require("{}_root_service"),
-            ) -> "ChildService":
+            ) -> ChildService:
                 _ = shared, scoped
                 return ChildService()
 
@@ -90,28 +90,28 @@ def test_service_lifetime_variants_and_eager_flag(isolated_service_registry):
     class SingletonByIntService(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor() -> "SingletonByIntService":
+            async def ctor() -> SingletonByIntService:
                 return SingletonByIntService()
 
     @Service("transient_by_int", lifetime=1)
     class TransientByIntService(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor() -> "TransientByIntService":
+            async def ctor() -> TransientByIntService:
                 return TransientByIntService()
 
     @Service("singleton_by_name", lifetime="Singleton")
     class SingletonByNameService(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor() -> "SingletonByNameService":
+            async def ctor() -> SingletonByNameService:
                 return SingletonByNameService()
 
     @Service("transient_by_name", lifetime="transient")
     class TransientByNameService(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor() -> "TransientByNameService":
+            async def ctor() -> TransientByNameService:
                 return TransientByNameService()
 
     plan = build_service_plan()
@@ -130,7 +130,7 @@ def test_eager_transient_is_rejected(isolated_service_registry):
         class BadTransientService(BaseService):
             class LifespanTasks(BaseService.LifespanTasks):
                 @staticmethod
-                async def ctor() -> "BadTransientService":
+                async def ctor() -> BadTransientService:
                     return BadTransientService()
 
 
@@ -203,7 +203,7 @@ async def test_named_service_can_depend_on_anonymous_service_by_type(
 
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor(shared=require(SharedPayload)) -> "ConsumerService":
+            async def ctor(shared=require(SharedPayload)) -> ConsumerService:
                 return ConsumerService(shared)
 
     container = ServiceContainer()
@@ -246,14 +246,14 @@ def test_require_string_key_cannot_target_anonymous_service(isolated_service_reg
     class AnonymousOnly(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor() -> "AnonymousOnly":
+            async def ctor() -> AnonymousOnly:
                 return AnonymousOnly()
 
     @Service("consumer")
     class ConsumerByKey(BaseService):
         class LifespanTasks(BaseService.LifespanTasks):
             @staticmethod
-            async def ctor(dep=require("anonymous_only")) -> "ConsumerByKey":
+            async def ctor(dep=require("anonymous_only")) -> ConsumerByKey:
                 _ = dep
                 return ConsumerByKey()
 

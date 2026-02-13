@@ -9,19 +9,14 @@ import types
 import uuid
 import weakref
 from collections.abc import AsyncIterator as AsyncIteratorABC
+from collections.abc import Awaitable, Callable
 from collections.abc import Awaitable as AwaitableABC
 from collections.abc import Coroutine as CoroutineABC
 from collections.abc import Iterator as IteratorABC
 from enum import IntEnum
 from typing import (
     Annotated,
-    Any,
-    Awaitable,
-    Callable,
-    Optional,
-    Type,
     TypeVar,
-    Union,
     get_args,
     get_origin,
     get_type_hints,
@@ -44,15 +39,10 @@ _CURRENT_REQUEST_CTX: contextvars.ContextVar[Request | None] = contextvars.Conte
 # - an Awaitable[T] (async def or sync returning awaitable)
 # - a synchronous contextmanager-style factory via Iterator[T]
 # - an asynchronous contextmanager-style factory via AsyncIterator[T]
-Ctor = Callable[..., Union[
-    T,
-    Awaitable[T],
-    IteratorABC[T],
-    AsyncIteratorABC[T],
-]]
+Ctor = Callable[..., T | Awaitable[T] | IteratorABC[T] | AsyncIteratorABC[T]]
 
 # Destructor (dtor): takes an instance T, may be sync or async
-Dtor = Optional[Callable[[T], Union[None, Awaitable[None]]]]
+Dtor = Callable[[T], None | Awaitable[None]] | None
 
 
 class ServiceLifetime(IntEnum):
@@ -117,23 +107,23 @@ class ServiceContainer:
                 container: ServiceContainer,
                 ctor: Ctor,
                 dtor: Dtor,
-                service_type: Any,
-                public_key: Optional[str],
+                service_type: object | None,
+                public_key: str | None,
                 internal_id: str,
-                *args: Any,
-                **kwargs: Any,
+                *args: object,
+                **kwargs: object,
         ) -> None:
             self._container_ref: weakref.ReferenceType[ServiceContainer] = weakref.ref(
                 container)
             self.ctor: Ctor = ctor
             self.dtor: Dtor = dtor
-            self.service_type: Any = service_type
-            self.public_key: Optional[str] = public_key
+            self.service_type: object | None = service_type
+            self.public_key: str | None = public_key
             self.internal_id: str = internal_id
 
-            self.instance: Any = None
-            self.ctor_args: tuple[Any, ...] = args
-            self.ctor_kwargs: dict[str, Any] = kwargs
+            self.instance: object | None = None
+            self.ctor_args: tuple[object, ...] = args
+            self.ctor_kwargs: dict[str, object] = kwargs
 
             # Async lock for single-instance creation.
             self._async_lock = asyncio.Lock()
@@ -215,18 +205,18 @@ class ServiceContainer:
                 self,
                 ctor: Ctor,
                 dtor: Dtor,
-                service_type: Any,
-                public_key: Optional[str],
+                service_type: object | None,
+                public_key: str | None,
                 internal_id: str,
         ) -> None:
             self.ctor: Ctor = ctor
             self.dtor: Dtor = dtor
-            self.service_type: Any = service_type
-            self.public_key: Optional[str] = public_key
+            self.service_type: object | None = service_type
+            self.public_key: str | None = public_key
             self.internal_id: str = internal_id
 
     # Type alias for internal service objects.
-    Service = Union[SingletonService, TransientService]
+    Service = SingletonService | TransientService
 
     def __init__(self) -> None:
         import os
@@ -236,10 +226,10 @@ class ServiceContainer:
         # public key -> internal_id
         self._key_index: dict[str, str] = {}
         # service_type -> set[internal_id]
-        self._type_index: dict[Any, set[str]] = {}
+        self._type_index: dict[object, set[str]] = {}
 
         # Guard against cross-loop / cross-thread access
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Guard against cross-process access
         self._pid: int = os.getpid()
@@ -299,7 +289,7 @@ class ServiceContainer:
         return loop
 
     @staticmethod
-    def _infer_service_type(ctor: Ctor) -> Any:
+    def _infer_service_type(ctor: Ctor) -> object | None:
         """
         Infer the logical "service type" from the factory's return annotation.
 
@@ -374,7 +364,7 @@ class ServiceContainer:
         origin = get_origin(ann)
 
         # Unwrap Optional[T] / Union[T, None] / T | None → T
-        if origin is Union or origin is types.UnionType:
+        if origin is types.UnionType:
             u_args = [a for a in get_args(ann) if a is not type(None)]
             if len(u_args) == 1:
                 ann = u_args[0]
@@ -449,7 +439,7 @@ class ServiceContainer:
         return ann
 
     @staticmethod
-    def _resolve_annotation_str(annotation: str, ctor: Ctor) -> Any | None:
+    def _resolve_annotation_str(annotation: str, ctor: Ctor) -> object | None:
         try:
             closure_vars = inspect.getclosurevars(ctor)
             localns = closure_vars.nonlocals if closure_vars else None
@@ -463,9 +453,9 @@ class ServiceContainer:
 
     def _register_type_index(
             self,
-            service_type: Any,
+            service_type: object | None,
             internal_id: str,
-            public_key: Optional[str],
+            public_key: str | None,
     ) -> None:
         """
         Update internal type index and enforce registration rules for a given type.
@@ -529,7 +519,7 @@ class ServiceContainer:
             raise RuntimeError(msg)
         return self._services[internal_id]
 
-    def _get_service_by_type(self, service_type: Any) -> Service:
+    def _get_service_by_type(self, service_type: object) -> Service:
         """
         Resolve a service by its registered type.
 
@@ -554,8 +544,8 @@ class ServiceContainer:
 
     @staticmethod
     def _make_async_finalizer(
-            dtor: Callable[[Any], Any],
-            instance: Any,
+            dtor: Callable[[object], object | Awaitable[object]],
+            instance: object,
     ) -> Callable[[], Awaitable[None]]:
         """
         Wrap a destructor into an async callable that can be awaited.
@@ -573,11 +563,11 @@ class ServiceContainer:
     async def _aget_impl(
             self,
             service: Service,
-            request: Optional[Request],
+            request: Request | None,
             key_label: str,
-            *args: Any,
-            **kwargs: Any,
-    ) -> Any:
+            *args: object,
+            **kwargs: object,
+    ) -> object:
         """
         Core async resolution logic shared by key-based and type-based resolution.
         """
@@ -614,7 +604,7 @@ class ServiceContainer:
             # Transient resolution.
             ctor = service.ctor
             dtor = service.dtor
-            finalizer: Optional[Callable[[], Awaitable[None]]] = None
+            finalizer: Callable[[], Awaitable[None]] | None = None
 
             # Execute factory: async directly, sync in a background thread to avoid blocking.
             if inspect.iscoroutinefunction(ctor):
@@ -766,12 +756,12 @@ class ServiceContainer:
 
     async def register(
             self,
-            key: Optional[str],
+            key: str | None,
             lifetime: ServiceLifetime,
             ctor: Ctor,
             dtor: Dtor,
-            *args: Any,
-            **kwargs: Any,
+            *args: object,
+            **kwargs: object,
     ) -> None:
         """
         Register a service in the container.
@@ -886,7 +876,10 @@ class ServiceContainer:
         """
         return f"_svc_ctx_{id(self)}"
 
-    def _get_or_create_request_ctx(self, request: Request) -> dict[str, Any]:
+    def _get_or_create_request_ctx(
+        self,
+        request: Request,
+    ) -> dict[str, list[Callable[[], Awaitable[None]]]]:
         """
         Return the per-request context dictionary for this container.
 
@@ -896,7 +889,9 @@ class ServiceContainer:
             }
         """
         key = self._request_ctx_key()
-        ctx = getattr(request.state, key, None)
+        ctx: dict[str, list[Callable[[], Awaitable[None]]]] | None = getattr(
+            request.state, key, None
+        )
         if ctx is None:
             ctx = {"transient_finalizers": []}
             setattr(request.state, key, ctx)
@@ -904,7 +899,7 @@ class ServiceContainer:
 
     def _attach_finalizer_to_request(
             self,
-            request: Optional[Request],
+            request: Request | None,
             finalizer: Callable[[], Awaitable[None]],
     ) -> None:
         """
@@ -922,7 +917,12 @@ class ServiceContainer:
         ctx = self._get_or_create_request_ctx(request)
         ctx["transient_finalizers"].append(finalizer)
 
-    async def aget_by_key(self, key: str, *args: Any, **kwargs: Any) -> Any:
+    async def aget_by_key(
+        self,
+        key: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
         """
         Asynchronously resolve a service instance by key.
 
@@ -932,13 +932,18 @@ class ServiceContainer:
         self._ensure_event_loop()
 
         _request_key = self.request_kwarg_name()
-        request: Optional[Request] = kwargs.pop(_request_key, None)
+        request: Request | None = kwargs.pop(_request_key, None)
 
         service = self._get_service_by_key(key)
         key_label = key
         return await self._aget_impl(service, request, key_label, *args, **kwargs)
 
-    async def aget_by_type(self, service_type: Type[Any], *args: Any, **kwargs: Any) -> Any:
+    async def aget_by_type(
+        self,
+        service_type: object,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
         """
         Asynchronously resolve a service instance by its registered type.
 
@@ -948,7 +953,7 @@ class ServiceContainer:
         self._ensure_event_loop()
 
         _request_key = self.request_kwarg_name()
-        request: Optional[Request] = kwargs.pop(_request_key, None)
+        request: Request | None = kwargs.pop(_request_key, None)
 
         service = self._get_service_by_type(service_type)
         label = service.public_key or f"<type:{service_type!r}>"
@@ -998,7 +1003,12 @@ class ServiceContainer:
                 self.destructing = False
                 logger.debug("Finished destruction of all singleton services.")
 
-    def require(self, key: str, *, allow_transient: bool = False) -> Callable[..., Awaitable[Any]]:
+    def require(
+        self,
+        key: str,
+        *,
+        allow_transient: bool = False,
+    ) -> Callable[..., Awaitable[object]]:
         """
         Declare a dependency on another registered service by key.
 
@@ -1046,7 +1056,7 @@ class ServiceContainerRegistry:
             self._containers[key] = container
         return key
 
-    def get_current(self) -> Optional[ServiceContainer]:
+    def get_current(self) -> ServiceContainer | None:
         try:
             key = self._current_key()
         except RuntimeError:
@@ -1058,7 +1068,7 @@ class ServiceContainerRegistry:
         self,
         *,
         expected: ServiceContainer | None = None,
-    ) -> Optional[ServiceContainer]:
+    ) -> ServiceContainer | None:
         try:
             key = self._current_key()
         except RuntimeError:
@@ -1078,7 +1088,9 @@ class ServiceContainerRegistry:
 _APP_STATE_REGISTRY_LOCK = threading.Lock()
 
 
-def get_or_create_service_container_registry(app_state: Any) -> ServiceContainerRegistry:
+def get_or_create_service_container_registry(
+    app_state: object,
+) -> ServiceContainerRegistry:
     """
     Return the app-level ServiceContainerRegistry, creating it if necessary.
     """
@@ -1095,7 +1107,7 @@ def get_or_create_service_container_registry(app_state: Any) -> ServiceContainer
         return registry
 
 
-def resolve_service_container(app_state: Any) -> Optional[ServiceContainer]:
+def resolve_service_container(app_state: object) -> ServiceContainer | None:
     """
     Resolve the ServiceContainer for the current execution context.
 
@@ -1112,9 +1124,9 @@ def resolve_service_container(app_state: Any) -> Optional[ServiceContainer]:
 
 
 def Inject(
-        target: Any = None,
-        *args: Any,
-        **kwargs: Any,
+        target: str | type[object] | None = None,
+        *args: object,
+        **kwargs: object,
 ) -> Depends:
     """
     Create a FastAPI dependency marker for a registered service.
@@ -1156,9 +1168,9 @@ def Inject(
         )
     ]
     pos_dep_map: dict[int, str] = {}
-    pos_static: dict[int, Any] = {}
+    pos_static: dict[int, object] = {}
     kw_dep_map: dict[str, str] = {}
-    kw_static: dict[str, Any] = {}
+    kw_static: dict[str, object] = {}
 
     for i, a in enumerate(args):
         if isinstance(a, Depends):
@@ -1190,7 +1202,10 @@ def Inject(
 
     sig = inspect.Signature(params)
 
-    async def _dependency_callable(request: Request, **resolved_deps: Any) -> Any:
+    async def _dependency_callable(
+        request: Request,
+        **resolved_deps: object,
+    ) -> object:
         services = resolve_service_container(getattr(request.app, "state", None))
         if services is None:
             msg = (

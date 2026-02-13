@@ -3,7 +3,6 @@ from __future__ import annotations
 import itertools
 import struct
 import time
-from typing import Optional
 from urllib.parse import quote, unquote
 
 import cbor2
@@ -580,7 +579,7 @@ class StoreStorageDataPathMixin:
         payload,
         expire_ts: int,
         callback_name: str,
-    ) -> Optional[ExpiryCallbackEvent]:
+    ) -> ExpiryCallbackEvent | None:
         if payload is None or len(payload) < _EXPIRY_STRUCT.size:
             return ExpiryCallbackEvent(
                 namespace=namespace,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
 
 import cbor2
 
@@ -29,7 +28,7 @@ def encode_job_payload(
     *,
     namespace: str,
     key: str,
-    value: Any,
+    value: object,
     expire_ts: int,
     callback: str,
     attempts: int,
@@ -46,7 +45,7 @@ def encode_job_payload(
     )
 
 
-def decode_job_payload(payload: bytes) -> dict[str, Any]:
+def decode_job_payload(payload: bytes) -> dict[str, object]:
     return cbor2.loads(payload)
 
 

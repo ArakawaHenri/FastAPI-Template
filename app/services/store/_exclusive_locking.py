@@ -2,22 +2,35 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Awaitable, Callable
 from functools import partial
-from typing import Any, Awaitable, Callable
+from types import TracebackType
+from typing import ParamSpec, Protocol, TypeVar
 from uuid import uuid4
 
 from loguru import logger
 
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class _StoreExclusiveOwner(Protocol):
+    async def _acquire_exclusive(self, namespace: str) -> tuple[str, bool]:
+        ...
+
+    def _release_exclusive(self, namespace: str) -> None:
+        ...
+
 
 class StoreExclusiveNamespaceLock:
-    def __init__(self, store: Any, namespace: str) -> None:
+    def __init__(self, store: _StoreExclusiveOwner, namespace: str) -> None:
         self._store = store
         self._namespace = namespace
         self._lease_id: str | None = None
         self._task_group: asyncio.TaskGroup | None = None
         self._enter_depth = 0
 
-    async def __aenter__(self) -> "StoreExclusiveNamespaceLock":
+    async def __aenter__(self) -> StoreExclusiveNamespaceLock:
         lease_id, owns_lease = await self._store._acquire_exclusive(
             self._namespace
         )
@@ -40,10 +53,10 @@ class StoreExclusiveNamespaceLock:
 
     def create_task(
         self,
-        coro: Awaitable[Any],
+        coro: Awaitable[_T],
         *,
         name: str | None = None,
-    ) -> asyncio.Task[Any]:
+    ) -> asyncio.Task[_T]:
         if self._task_group is None:
             raise RuntimeError(
                 "This lock instance does not own the active lease task group. "
@@ -53,13 +66,18 @@ class StoreExclusiveNamespaceLock:
 
     def start_soon(
         self,
-        fn: Callable[..., Awaitable[Any]],
-        *args: Any,
-        **kwargs: Any,
-    ) -> asyncio.Task[Any]:
+        fn: Callable[_P, Awaitable[_T]],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> asyncio.Task[_T]:
         return self.create_task(fn(*args, **kwargs))
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         if self._enter_depth <= 0:
             logger.warning(
                 "[STORE] Exclusive namespace lock exited without enter",

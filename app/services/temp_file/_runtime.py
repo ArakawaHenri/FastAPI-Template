@@ -3,23 +3,26 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import ParamSpec, TypeVar
 
 from filelock import FileLock, Timeout
 from loguru import logger
 
 _LOG_PREFIX = "TMP"
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 
 
 async def run_in_executor(
     executor: ThreadPoolExecutor,
-    fn,
-    *args,
-    **kwargs,
-):
+    fn: Callable[_P, _T],
+    *args: _P.args,
+    **kwargs: _P.kwargs,
+) -> _T:
     """Run sync work on the service-owned thread pool."""
     if kwargs:
         fn = partial(fn, **kwargs)
@@ -27,7 +30,7 @@ async def run_in_executor(
     return await loop.run_in_executor(executor, fn, *args)
 
 
-def try_acquire_file_lock(path: Path) -> Optional[FileLock]:
+def try_acquire_file_lock(path: Path) -> FileLock | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Lock ownership may be released from a different thread than acquisition,
     # so do not use thread-local context.
@@ -40,7 +43,7 @@ def try_acquire_file_lock(path: Path) -> Optional[FileLock]:
     return lock
 
 
-def release_file_lock(handle: Optional[FileLock]) -> None:
+def release_file_lock(handle: FileLock | None) -> None:
     if handle is None:
         return
     try:
@@ -70,7 +73,7 @@ def tighten_file_permissions(path: Path) -> None:
 
 async def cleanup_loop(
     name: str,
-    cleanup_fn,
+    cleanup_fn: Callable[[float], Awaitable[None]],
     stop_event: asyncio.Event,
     interval_seconds: int = 60,
 ) -> None:

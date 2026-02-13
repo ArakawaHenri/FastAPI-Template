@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -23,7 +21,7 @@ class AppException(Exception):
         message: str,
         status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
         error_code: str = "INTERNAL_ERROR",
-        details: dict[str, Any] | None = None
+        details: dict[str, object] | None = None
     ):
         self.message = message
         self.status_code = status_code
@@ -34,7 +32,7 @@ class AppException(Exception):
 
 class NotFoundException(AppException):
     """Raised when a resource is not found"""
-    def __init__(self, resource: str, identifier: Any = None):
+    def __init__(self, resource: str, identifier: object = None):
         message = f"{resource} not found"
         if identifier is not None:
             message += f": {identifier}"
@@ -71,7 +69,7 @@ class ForbiddenException(AppException):
 
 class BadRequestException(AppException):
     """Raised for invalid client requests"""
-    def __init__(self, message: str, details: dict[str, Any] | None = None):
+    def __init__(self, message: str, details: dict[str, object] | None = None):
         super().__init__(
             message=message,
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -82,7 +80,7 @@ class BadRequestException(AppException):
 
 class ConflictException(AppException):
     """Raised when there's a conflict with existing data"""
-    def __init__(self, message: str, details: dict[str, Any] | None = None):
+    def __init__(self, message: str, details: dict[str, object] | None = None):
         super().__init__(
             message=message,
             status_code=status.HTTP_409_CONFLICT,
@@ -106,7 +104,7 @@ class RateLimitException(AppException):
 # Exception Handlers
 # =============================================================================
 
-def _serialize_debug_body(body: Any) -> Any:
+def _serialize_debug_body(body: object) -> object:
     """
     Convert validation body payload into JSON-safe content for debug responses.
 
@@ -128,7 +126,7 @@ def create_error_response(
     status_code: int,
     message: str,
     error_code: str = "ERROR",
-    details: dict[str, Any] | None = None,
+    details: dict[str, object] | None = None,
     request_path: str | None = None
 ) -> JSONResponse:
     """Create standardized error response"""

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -34,7 +34,7 @@ class DatabaseEngineService(BaseService):
             max_overflow: int = 10,
             pool_recycle: int = 3600,
             pool_pre_ping: bool = True
-        ) -> "DatabaseEngineService":
+        ) -> DatabaseEngineService:
             return DatabaseEngineService(
                 url=url,
                 pool_size=pool_size,
@@ -44,7 +44,7 @@ class DatabaseEngineService(BaseService):
             )
 
         @staticmethod
-        async def dtor(instance: "DatabaseEngineService") -> None:
+        async def dtor(instance: DatabaseEngineService) -> None:
             await instance.engine.dispose()
             logger.debug("[DB] Database engine disposed", db_name=instance.db_name)
 

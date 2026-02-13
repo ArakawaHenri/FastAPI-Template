@@ -6,16 +6,16 @@ import inspect
 import pkgutil
 import threading
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Literal
 
 from loguru import logger
 
 from app.core.dependencies import ServiceContainer, ServiceLifetime
 
-Ctor = Callable[..., Any]
-Dtor = Optional[Callable[[Any], Any]]
+Ctor = Callable[..., object]
+Dtor = Callable[[object], object | Awaitable[object]] | None
 LifetimeLike = ServiceLifetime | int | Literal[
     "Singleton",
     "Transient",
@@ -25,7 +25,7 @@ LifetimeLike = ServiceLifetime | int | Literal[
 ExpandedDefinition = tuple[
     "_ServiceDefinition",
     str | None,
-    dict[str, Any],
+    dict[str, object],
     dict[str, "RequiredService"],
     inspect.Signature,
 ]
@@ -33,23 +33,23 @@ ResolvedByInternalId = tuple[
     "_ServiceDefinition",
     dict[str, "RequiredService"],
     inspect.Signature,
-    dict[str, Any],
-    Any,
+    dict[str, object],
+    object,
     str | None,
 ]
 ResolvedSpec = tuple[
     "_ServiceDefinition",
     inspect.Signature,
-    dict[str, Any],
+    dict[str, object],
     tuple["_ResolvedDependency", ...],
-    Any,
+    object,
     str | None,
 ]
 
 
 @dataclass(frozen=True)
 class RequiredService:
-    target: str | type[Any]
+    target: str | type[object]
     allow_transient: bool = False
 
     def render_for_dict_key(self, dict_key: str) -> RequiredService:
@@ -64,22 +64,22 @@ class RequiredService:
 @dataclass(frozen=True)
 class _ServiceDefinition:
     origin: str
-    service_cls: type[Any]
+    service_cls: type[object]
     key_template: str | None
     lifetime: ServiceLifetime
     eager: bool
     ctor: Ctor
     dtor: Dtor
     dependencies: dict[str, RequiredService]
-    source: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None
-    exposed_type: Any = None
+    source: Mapping[str, object] | Callable[[], Mapping[str, object]] | None = None
+    exposed_type: object | None = None
 
 
 @dataclass(frozen=True)
 class _ResolvedDependency:
     param_name: str
     dep_key: str | None
-    dep_type: type[Any] | None
+    dep_type: type[object] | None
 
 
 @dataclass(frozen=True)
@@ -92,16 +92,16 @@ class _CompiledService:
     ctor: Ctor
     dtor: Dtor
     signature: inspect.Signature
-    static_kwargs: dict[str, Any]
+    static_kwargs: dict[str, object]
     dependencies: tuple[_ResolvedDependency, ...]
-    service_type: Any
+    service_type: object
 
 
 @dataclass(frozen=True)
 class RegisteredService:
     key: str | None
     origin: str
-    service_type: Any
+    service_type: object
 
 
 class ServiceRegistry:
@@ -134,7 +134,7 @@ class ServiceRegistry:
             cls._definition_order.clear()
 
 
-def require(target: str | type[Any], *, allow_transient: bool = False) -> RequiredService:
+def require(target: str | type[object], *, allow_transient: bool = False) -> RequiredService:
     if not isinstance(target, (str, type)):
         raise TypeError("require() expects a service key (str) or a service type")
     return RequiredService(target=target, allow_transient=allow_transient)
@@ -165,7 +165,7 @@ def _normalize_lifetime(lifetime: LifetimeLike) -> ServiceLifetime:
     )
 
 
-def _extract_ctors(service_cls: type[Any]) -> tuple[Ctor, Dtor]:
+def _extract_ctors(service_cls: type[object]) -> tuple[Ctor, Dtor]:
     lifespan_tasks = getattr(service_cls, "LifespanTasks", None)
     if lifespan_tasks is None:
         raise TypeError(f"{service_cls!r} has no LifespanTasks class")
@@ -192,14 +192,14 @@ def _extract_dependencies(ctor: Ctor) -> dict[str, RequiredService]:
 
 
 def _register_service_class(
-    service_cls: type[Any],
+    service_cls: type[object],
     *,
     key: str | None,
-    source: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None,
+    source: Mapping[str, object] | Callable[[], Mapping[str, object]] | None = None,
     lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
     eager: bool = False,
-    exposed_type: Any = None,
-) -> type[Any]:
+    exposed_type: object | None = None,
+) -> type[object]:
     ctor, dtor = _extract_ctors(service_cls)
     deps = _extract_dependencies(ctor)
 
@@ -229,12 +229,12 @@ def _register_service_class(
 
 
 def Service(
-    key: str | type[Any] | None = None,
+    key: str | type[object] | None = None,
     *,
     lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
     eager: bool = False,
-    exposed_type: Any = None,
-) -> Callable[[type[Any]], type[Any]] | type[Any]:
+    exposed_type: object | None = None,
+) -> Callable[[type[object]], type[object]] | type[object]:
     """
     Register a service class.
 
@@ -245,7 +245,10 @@ def Service(
     - @Service()
     """
 
-    def _register_with_key(service_cls: type[Any], resolved_key: str | None) -> type[Any]:
+    def _register_with_key(
+        service_cls: type[object],
+        resolved_key: str | None,
+    ) -> type[object]:
         return _register_service_class(
             service_cls,
             key=resolved_key,
@@ -262,7 +265,7 @@ def Service(
             "Service() expects a key string, a service class, or no positional argument."
         )
 
-    def _decorator(service_cls: type[Any]) -> type[Any]:
+    def _decorator(service_cls: type[object]) -> type[object]:
         return _register_with_key(service_cls, key)
 
     return _decorator
@@ -271,12 +274,12 @@ def Service(
 def ServiceDict(
     key: str,
     *,
-    dict: Mapping[str, Any] | Callable[[], Mapping[str, Any]],
+    dict: Mapping[str, object] | Callable[[], Mapping[str, object]],
     lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
     eager: bool = False,
-    exposed_type: Any = None,
-) -> Callable[[type[Any]], type[Any]]:
-    def _decorator(service_cls: type[Any]) -> type[Any]:
+    exposed_type: object | None = None,
+) -> Callable[[type[object]], type[object]]:
+    def _decorator(service_cls: type[object]) -> type[object]:
         return _register_service_class(
             service_cls,
             key=key,
@@ -310,11 +313,11 @@ def _render_service_key(key_template: str, dict_key: str) -> str:
 
 
 def _coerce_mapping_value(
-    value: Any,
+    value: object,
     *,
     signature: inspect.Signature,
     dependency_params: set[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     if hasattr(value, "model_dump") and callable(value.model_dump):
         raw = value.model_dump()
         if not isinstance(raw, Mapping):
@@ -338,7 +341,9 @@ def _coerce_mapping_value(
     raise TypeError("Unable to map ServiceDict value to ctor parameters")
 
 
-def _resolve_source(source: Mapping[str, Any] | Callable[[], Mapping[str, Any]]) -> Mapping[str, Any]:
+def _resolve_source(
+    source: Mapping[str, object] | Callable[[], Mapping[str, object]],
+) -> Mapping[str, object]:
     resolved = source() if callable(source) else source
     if not isinstance(resolved, Mapping):
         raise TypeError("ServiceDict source must resolve to a mapping")
@@ -384,7 +389,7 @@ def _resolve_dependency_targets(
 ) -> list[_CompiledService]:
     by_internal_id: dict[str, ResolvedByInternalId] = {}
     public_key_index: dict[str, str] = {}
-    type_index: dict[Any, list[str]] = defaultdict(list)
+    type_index: dict[object, list[str]] = defaultdict(list)
 
     anon_seq = 0
     for definition, key, static_kwargs, deps, signature in compiled:
@@ -595,7 +600,7 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
     ctor = spec.ctor
     signature = spec.signature.replace(return_annotation=spec.service_type)
 
-    async def _bound_ctor(*args: Any, **kwargs: Any) -> Any:
+    async def _bound_ctor(*args: object, **kwargs: object) -> object:
         provided_names: set[str] = set()
         try:
             provided_names = set(signature.bind_partial(*args, **kwargs).arguments)
@@ -614,7 +619,7 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
         for dep in spec.dependencies:
             if dep.param_name in provided_names or dep.param_name in call_kwargs:
                 continue
-            dep_kwargs: dict[str, Any] = {}
+            dep_kwargs: dict[str, object] = {}
             if request is not None:
                 dep_kwargs[request_kwarg_name] = request
             if dep.dep_key is not None:

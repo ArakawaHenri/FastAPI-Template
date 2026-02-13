@@ -5,7 +5,6 @@ import struct
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Optional
 from uuid import uuid4
 
 import cbor2
@@ -238,7 +237,7 @@ class StoreCallbackPipelineMixin:
             txn.put(due_key, job_id, db=self._callback_schedule_db)
             self._adjust_callback_count_in_txn(txn, callback_name, 1)
 
-    def _peek_due_callback_job(self, now_ts: int) -> Optional[_CallbackJob]:
+    def _peek_due_callback_job(self, now_ts: int) -> _CallbackJob | None:
         with self._meta_env.begin(write=True) as txn, txn.cursor(db=self._callback_schedule_db) as cursor:
             if not cursor.first():
                 return None
@@ -397,7 +396,7 @@ class StoreCallbackPipelineMixin:
 
     def _decode_callback_job(
         self, payload: bytes
-    ) -> Optional[tuple[ExpiryCallbackEvent, int]]:
+    ) -> tuple[ExpiryCallbackEvent, int] | None:
         try:
             data = decode_job_payload(payload)
         except Exception:
@@ -524,7 +523,7 @@ class StoreCallbackPipelineMixin:
             return
         txn.put(key, _EXPIRY_STRUCT.pack(next_count), db=self._callback_count_db)
 
-    def _decode_callback_name(self, raw: bytes) -> Optional[str]:
+    def _decode_callback_name(self, raw: bytes) -> str | None:
         try:
             return raw.decode("utf-8")
         except Exception:

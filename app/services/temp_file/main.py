@@ -8,13 +8,15 @@ import stat
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import ClassVar
 from urllib.parse import quote
 
+from filelock import FileLock
 from loguru import logger
 
 from app.core.settings import settings
@@ -48,13 +50,19 @@ class TempFileConfig:
 
 @dataclass
 class _SharedTempFileEntry:
-    instance: "TempFileService"
-    signature: tuple[Any, ...]
+    instance: TempFileService
+    signature: tuple[object, ...]
     ref_count: int = 1
     ready: threading.Event = field(default_factory=threading.Event)
     init_error: BaseException | None = None
     closing: bool = False
     close_done: threading.Event = field(default_factory=_new_signaled_event)
+
+
+type StoreProvider = (
+    StoreService
+    | Callable[[], StoreService | Awaitable[StoreService]]
+)
 
 
 @Service("temp_file_service", eager=True)
@@ -91,7 +99,7 @@ class TempFileService(
             max_file_size_mb: int = settings.tmp_max_file_size_mb,
             max_total_size_mb: int = settings.tmp_max_total_size_mb,
             store_provider=require("store_service"),
-        ) -> "TempFileService":
+        ) -> TempFileService:
             store = await TempFileService._resolve_store_provider(store_provider)
             service = await TempFileService.acquire_shared(
                 TempFileConfig(
@@ -109,7 +117,7 @@ class TempFileService(
             return service
 
         @staticmethod
-        async def dtor(instance: "TempFileService") -> None:
+        async def dtor(instance: TempFileService) -> None:
             await TempFileService.release_shared(instance)
 
     # ------------------------------------------------------------------ #
@@ -126,7 +134,7 @@ class TempFileService(
         return f"{store_key}|{base_dir}|{config.namespace}"
 
     @staticmethod
-    def _shared_temp_signature(config: TempFileConfig) -> tuple[Any, ...]:
+    def _shared_temp_signature(config: TempFileConfig) -> tuple[object, ...]:
         return (
             config.retention_days,
             config.cleanup_interval_seconds,
@@ -140,7 +148,7 @@ class TempFileService(
     def _try_reuse_shared_locked(
         cls,
         key: str,
-        signature: tuple[Any, ...],
+        signature: tuple[object, ...],
     ) -> tuple[_SharedTempFileEntry | None, threading.Event | None]:
         entry = cls._shared_instances.get(key)
         if entry is None:
@@ -162,7 +170,7 @@ class TempFileService(
     def _register_new_shared_locked(
         cls,
         key: str,
-        signature: tuple[Any, ...],
+        signature: tuple[object, ...],
         config: TempFileConfig,
         store: StoreService,
     ) -> _SharedTempFileEntry:
@@ -194,7 +202,7 @@ class TempFileService(
     def _release_shared_locked(
         cls,
         key: str,
-        instance: "TempFileService",
+        instance: TempFileService,
     ) -> tuple[bool, bool, _SharedTempFileEntry | None]:
         entry = cls._shared_instances.get(key)
         if entry is None or entry.instance is not instance:
@@ -223,7 +231,7 @@ class TempFileService(
         cls,
         config: TempFileConfig,
         store: StoreService,
-    ) -> "TempFileService":
+    ) -> TempFileService:
         key = cls._shared_temp_key(config, store)
         signature = cls._shared_temp_signature(config)
         entry: _SharedTempFileEntry
@@ -278,7 +286,7 @@ class TempFileService(
         return service
 
     @classmethod
-    async def release_shared(cls, instance: "TempFileService") -> None:
+    async def release_shared(cls, instance: TempFileService) -> None:
         if not getattr(instance, "_shared_registry_managed", False):
             await instance.shutdown()
             return
@@ -325,10 +333,10 @@ class TempFileService(
 
         self._retention_seconds = config.retention_days * 24 * 60 * 60
         self._retention_minutes = config.retention_days * 24 * 60
-        self._max_file_size_bytes: Optional[int] = None
+        self._max_file_size_bytes: int | None = None
         if config.max_file_size_mb > 0:
             self._max_file_size_bytes = config.max_file_size_mb * 1024 * 1024
-        self._max_total_size_bytes: Optional[int] = None
+        self._max_total_size_bytes: int | None = None
         if config.max_total_size_mb > 0:
             self._max_total_size_bytes = config.max_total_size_mb * 1024 * 1024
         self._cleanup_interval_seconds = config.cleanup_interval_seconds
@@ -345,9 +353,9 @@ class TempFileService(
 
         self._total_size_bytes: int = 0
         self._cleanup_stop = asyncio.Event()
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self._size_recalc_task: Optional[asyncio.Task] = None
-        self._cleanup_lock_handle: Any | None = None
+        self._cleanup_task: asyncio.Task | None = None
+        self._size_recalc_task: asyncio.Task | None = None
+        self._cleanup_lock_handle: FileLock | None = None
         self._init_runtime_dispatch_state()
         self._closed = False
         self._executor_shutdown = False
@@ -388,7 +396,9 @@ class TempFileService(
         return is_text, revision
 
     @staticmethod
-    async def _resolve_store_provider(store_provider) -> StoreService:
+    async def _resolve_store_provider(
+        store_provider: StoreProvider | None,
+    ) -> StoreService:
         if store_provider is None:
             raise ValueError(
                 "TempFileService requires a StoreService dependency")
@@ -625,7 +635,7 @@ class TempFileService(
                 )
                 raise
 
-    async def read(self, filename: str) -> Optional[str | bytes]:
+    async def read(self, filename: str) -> str | bytes | None:
         if not self._is_runtime_thread():
             return await self._run_on_runtime_thread(self.read, filename)
         self._assert_open()
@@ -675,7 +685,7 @@ class TempFileService(
             return data.decode("utf-8")
         return data
 
-    async def cleanup_expired(self, now: Optional[float] = None) -> None:
+    async def cleanup_expired(self, now: float | None = None) -> None:
         if not self._is_runtime_thread():
             return await self._run_on_runtime_thread(self.cleanup_expired, now)
         self._assert_open()
@@ -813,17 +823,17 @@ class TempFileService(
             raise RuntimeError("TempFileService is closed")
 
     @staticmethod
-    def _try_acquire_file_lock(path: Path) -> Any | None:
+    def _try_acquire_file_lock(path: Path) -> FileLock | None:
         return _runtime.try_acquire_file_lock(path)
 
     @staticmethod
-    def _release_file_lock(handle: Any | None) -> None:
+    def _release_file_lock(handle: FileLock | None) -> None:
         _runtime.release_file_lock(handle)
 
     async def _cleanup_loop(
         self,
         name: str,
-        cleanup_fn,
+        cleanup_fn: Callable[[float], Awaitable[None]],
         stop_event: asyncio.Event,
         interval_seconds: int = 60,
     ) -> None:
