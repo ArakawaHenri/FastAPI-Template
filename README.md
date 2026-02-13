@@ -88,31 +88,19 @@ Use `.env.production_example` and `.env.debug_example` as starting points.
 ## Project structure
 
 ```
-app/
-├── api/                      # Routing entrypoints
-│   ├── main.py               # /api router aggregation
-│   └── v1/                   # Versioned APIs
-│       ├── main.py           # /api/v1 router aggregation
-│       └── example/          # Exception examples (remove in production)
-├── core/                     # Infrastructure
-│   ├── dependencies.py       # ServiceContainer (DI) and inject helper
-│   ├── logger.py             # Loguru setup and stdlib interception
-│   └── settings.py           # Pydantic settings
-├── lifespan/                 # Startup/shutdown wiring
-│   └── main.py               # Service registration and teardown
-├── middleware/               # Request/response middleware
-│   ├── exception.py          # Error types and handlers
-│   └── logging.py            # Request logging
-├── services/                 # Business services and examples
-│   ├── store/                # LMDB-backed key-value store
-│   │   ├── main.py           # Store domain logic
-│   │   └── _runtime.py       # Store-only runtime helpers (executor/locks)
-│   ├── temp_file/            # Temporary file manager
-│   │   ├── main.py           # Temp-file domain logic
-│   │   └── _runtime.py       # Temp-file-only runtime helpers
-│   └── base.py               # BaseService and lifecycle contract
-└── main.py                   # FastAPI app factory
-main.py                       # CLI runner for granian
+.
+├── app/
+│   ├── api/                  # API routers (/api, /api/v1)
+│   ├── core/                 # DI container, service registry, logging, settings
+│   ├── lifespan/             # Startup/shutdown orchestration
+│   ├── middleware/           # Request logging + unified exception handlers
+│   ├── services/             # Store, temp-file, database, semaphore, examples
+│   └── main.py               # FastAPI app factory
+├── tests/                    # Unit/integration tests
+├── docs/                     # Additional docs
+├── main.py                   # CLI runner (granian)
+├── pyproject.toml            # Dependencies and tool config
+└── Dockerfile                # Container image definition
 ```
 
 ## Programming guide and conventions
@@ -127,13 +115,16 @@ main.py                       # CLI runner for granian
 
 - Naming: singletons end with `Service`, transients end with `ServiceT`.
 - Register services via decorators:
-`@Service("key", lifetime=..., eager=...)` and
-`@ServiceDict("template", dict=..., lifetime=..., eager=...)`.
+`@Service("key", lifetime=..., eager=...)`,
+`@Service` / `@Service()` (anonymous singleton),
+and `@ServiceDict("template", dict=..., lifetime=..., eager=...)`.
 - `lifetime` accepts `ServiceLifetime`, `0/1`, or
 `"Singleton"/"Transient"` (case-insensitive) and defaults to singleton.
 - `eager=True` is singleton-only and instantiates at startup.
 - Use `Inject("key")` for key-based resolution; use type-based injection only when a single service of that type exists.
 - For type-based resolution, `ServiceContainer` uses the factory (`ctor`) return annotation as the service type.
+- Anonymous services are type-only (`aget_by_type`) and follow container constraints:
+one anonymous service per type, and no coexistence with a named service of the same type.
 - Session example: `session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`.
 - `ServiceContainer` itself is single-loop; do not use one container across event loops/threads.
 - Lifespan binds one container per current loop into `app.state.sc_registry` (free-threaded safe).
@@ -170,8 +161,8 @@ main.py                       # CLI runner for granian
 
 ### Error handling
 
-- Use the custom exceptions for consistent error shapes and status codes.
-- `DEBUG_MODE=true` re-raises uncaught errors; production should keep it `false`.
+- Use the exception types in `app/middleware/exception.py`.
+- See the dedicated **Error handling** section below for response format and mappings.
 
 ### Logging
 
@@ -288,10 +279,6 @@ if "@" not in email:
 ## Notes and pitfalls
 
 - Example routes under `/api/v1/example` are for reference only; remove them for production services.
-- `CORS_ORIGINS` defaults to empty; configure explicitly for browsers.
-- `DEBUG_MODE=true` exposes request body in validation errors; do not enable in production.
 - If transient services are resolved outside of a request context, their destructors will not run automatically.
 - Do not read/write `app.state.services` directly in application code; resolve via `Inject(...)` so loop-local registry routing is applied.
-- Temp-file size-limit breaches (`TMP_MAX_FILE_SIZE_MB`, `TMP_MAX_TOTAL_SIZE_MB`) are logged as `error` and raised to callers as `ValueError`; the service continues running.
 - Expiry callback names missing in the active worker are logged as `error`; register callbacks consistently across workers.
-- Namespace-exclusive access now uses `create_namespace_lock()`; the legacy `exclusive()` API has been migrated.

@@ -88,31 +88,19 @@ uv run python main.py --host 0.0.0.0 --port 8000
 ## 项目结构
 
 ```
-app/
-├── api/                      # 路由入口
-│   ├── main.py               # /api 路由汇总
-│   └── v1/                   # 版本化 API
-│       ├── main.py           # /api/v1 路由汇总
-│       └── example/          # 异常示例（生产移除）
-├── core/                     # 基础设施
-│   ├── dependencies.py       # ServiceContainer (DI) 与 inject
-│   ├── logger.py             # loguru 配置与标准库拦截
-│   └── settings.py           # 配置读取
-├── lifespan/                 # 启动/关闭流程
-│   └── main.py               # 服务注册与释放
-├── middleware/               # 中间件
-│   ├── exception.py          # 错误类型与处理
-│   └── logging.py            # 请求日志
-├── services/                 # 业务服务与示例
-│   ├── store/                # LMDB 键值存储
-│   │   ├── main.py           # Store 领域逻辑
-│   │   └── _runtime.py       # Store 独立运行时辅助（线程池/锁）
-│   ├── temp_file/            # 临时文件管理
-│   │   ├── main.py           # 临时文件领域逻辑
-│   │   └── _runtime.py       # TempFile 独立运行时辅助
-│   └── base.py               # BaseService 与生命周期约定
-└── main.py                   # FastAPI 应用入口
-main.py                       # granian 启动脚本
+.
+├── app/
+│   ├── api/                  # API 路由（/api, /api/v1）
+│   ├── core/                 # DI 容器、服务注册、日志、配置
+│   ├── lifespan/             # 启动/关闭编排
+│   ├── middleware/           # 请求日志与统一异常处理
+│   ├── services/             # Store、TempFile、Database、Semaphore、示例服务
+│   └── main.py               # FastAPI 应用工厂
+├── tests/                    # 单元/集成测试
+├── docs/                     # 补充文档
+├── main.py                   # CLI 启动脚本（granian）
+├── pyproject.toml            # 依赖与工具配置
+└── Dockerfile                # 镜像构建定义
 ```
 
 ## 编程规范与引导
@@ -127,12 +115,15 @@ main.py                       # granian 启动脚本
 
 - 命名规范：单例以 `Service` 结尾，瞬态以 `ServiceT` 结尾。
 - 通过装饰器注册服务：
-`@Service("key", lifetime=..., eager=...)` 与
+`@Service("key", lifetime=..., eager=...)`、
+`@Service` / `@Service()`（匿名单例）与
 `@ServiceDict("template", dict=..., lifetime=..., eager=...)`。
 - `lifetime` 支持 `ServiceLifetime`、`0/1`、`"Singleton"/"Transient"`（大小写不敏感），默认单例。
 - `eager=True` 仅支持单例，表示启动时立即实例化。
 - `Inject("key")` 用于 key 注入；类型注入仅在唯一注册时使用。
 - 类型注入时，`ServiceContainer` 会以工厂函数（`ctor`）的返回注解作为服务类型。
+- 匿名服务仅支持按类型解析（`aget_by_type`），并遵循容器约束：
+同一类型只能存在一个匿名服务，且不能与同类型具名服务共存。
 - Session 示例：`session: AsyncSession = Inject(AsyncSession, Inject("main_database_service"))`。
 - `ServiceContainer` 本身是单事件循环模型，不要跨事件循环或线程复用同一个容器。
 - Lifespan 会将“当前循环对应的容器”绑定到 `app.state.sc_registry`（可适配 free-threaded worker）。
@@ -169,8 +160,8 @@ main.py                       # granian 启动脚本
 
 ### 错误处理
 
-- 自定义异常用于统一错误结构与状态码。
-- 生产环境保持 `DEBUG_MODE=false`。
+- 使用 `app/middleware/exception.py` 中定义的异常类型。
+- 具体响应结构与状态码映射见下方 **异常处理** 章节。
 
 ### 日志
 
@@ -287,10 +278,6 @@ if "@" not in email:
 ## 注意点
 
 - `/api/v1/example` 仅用于参考，生产应移除。
-- `CORS_ORIGINS` 默认为空，需显式配置。
-- `DEBUG_MODE=true` 会回显请求体，生产必须禁用。
 - 在请求上下文之外解析瞬态服务时，析构器不会自动执行。
 - 不要在业务代码中直接读写 `app.state.services`；应通过 `Inject(...)` 解析服务，才能走到按事件循环路由的容器映射。
-- 临时文件容量超限（`TMP_MAX_FILE_SIZE_MB`、`TMP_MAX_TOTAL_SIZE_MB`）会记录 `error` 并向调用方抛出 `ValueError`，但不会导致服务退出。
 - 活跃 worker 中缺少对应过期回调名时会记录 `error`；请确保所有 worker 回调注册一致。
-- namespace 独占访问 API 已迁移为 `create_namespace_lock()`；旧的 `exclusive()` 不再使用。

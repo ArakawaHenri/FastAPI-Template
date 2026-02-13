@@ -24,17 +24,18 @@ LifetimeLike = ServiceLifetime | int | Literal[
 ]
 ExpandedDefinition = tuple[
     "_ServiceDefinition",
-    str,
+    str | None,
     dict[str, Any],
     dict[str, "RequiredService"],
     inspect.Signature,
 ]
-ResolvedByKey = tuple[
+ResolvedByInternalId = tuple[
     "_ServiceDefinition",
     dict[str, "RequiredService"],
     inspect.Signature,
     dict[str, Any],
     Any,
+    str | None,
 ]
 ResolvedSpec = tuple[
     "_ServiceDefinition",
@@ -42,6 +43,7 @@ ResolvedSpec = tuple[
     dict[str, Any],
     tuple["_ResolvedDependency", ...],
     Any,
+    str | None,
 ]
 
 
@@ -63,7 +65,7 @@ class RequiredService:
 class _ServiceDefinition:
     origin: str
     service_cls: type[Any]
-    key_template: str
+    key_template: str | None
     lifetime: ServiceLifetime
     eager: bool
     ctor: Ctor
@@ -76,13 +78,15 @@ class _ServiceDefinition:
 @dataclass(frozen=True)
 class _ResolvedDependency:
     param_name: str
-    dep_key: str
+    dep_key: str | None
+    dep_type: type[Any] | None
 
 
 @dataclass(frozen=True)
 class _CompiledService:
     origin: str
-    key: str
+    internal_id: str
+    key: str | None
     lifetime: ServiceLifetime
     eager: bool
     ctor: Ctor
@@ -90,6 +94,13 @@ class _CompiledService:
     signature: inspect.Signature
     static_kwargs: dict[str, Any]
     dependencies: tuple[_ResolvedDependency, ...]
+    service_type: Any
+
+
+@dataclass(frozen=True)
+class RegisteredService:
+    key: str | None
+    origin: str
     service_type: Any
 
 
@@ -183,7 +194,7 @@ def _extract_dependencies(ctor: Ctor) -> dict[str, RequiredService]:
 def _register_service_class(
     service_cls: type[Any],
     *,
-    key: str,
+    key: str | None,
     source: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None,
     lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
     eager: bool = False,
@@ -196,6 +207,10 @@ def _register_service_class(
     if eager and resolved_lifetime != ServiceLifetime.SINGLETON:
         raise ValueError(
             f"Service '{service_cls.__name__}' cannot be eager with transient lifetime."
+        )
+    if source is not None and key is None:
+        raise ValueError(
+            f"ServiceDict '{service_cls.__name__}' requires a non-empty key template."
         )
     definition = _ServiceDefinition(
         origin=f"{service_cls.__module__}.{service_cls.__qualname__}",
@@ -214,21 +229,41 @@ def _register_service_class(
 
 
 def Service(
-    key: str,
+    key: str | type[Any] | None = None,
     *,
     lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
     eager: bool = False,
     exposed_type: Any = None,
-) -> Callable[[type[Any]], type[Any]]:
-    def _decorator(service_cls: type[Any]) -> type[Any]:
+) -> Callable[[type[Any]], type[Any]] | type[Any]:
+    """
+    Register a service class.
+
+    Supported forms:
+    - @Service("my_key")
+    - @Service("my_key", lifetime="transient")
+    - @Service
+    - @Service()
+    """
+
+    def _register_with_key(service_cls: type[Any], resolved_key: str | None) -> type[Any]:
         return _register_service_class(
             service_cls,
-            key=key,
+            key=resolved_key,
             source=None,
             lifetime=lifetime,
             eager=eager,
             exposed_type=exposed_type,
         )
+
+    if isinstance(key, type):
+        return _register_with_key(key, None)
+    if key is not None and not isinstance(key, str):
+        raise TypeError(
+            "Service() expects a key string, a service class, or no positional argument."
+        )
+
+    def _decorator(service_cls: type[Any]) -> type[Any]:
+        return _register_with_key(service_cls, key)
 
     return _decorator
 
@@ -321,6 +356,11 @@ def _expand_definitions() -> list[ExpandedDefinition]:
             expanded.append((definition, definition.key_template, {}, definition.dependencies, signature))
             continue
 
+        if definition.key_template is None:
+            raise RuntimeError(
+                f"Service definition '{definition.origin}' has dict source but no key template."
+            )
+
         source_mapping = _resolve_source(definition.source)
         for raw_dict_key, raw_value in source_mapping.items():
             dict_key = str(raw_dict_key)
@@ -342,85 +382,131 @@ def _expand_definitions() -> list[ExpandedDefinition]:
 def _resolve_dependency_targets(
     compiled: list[ExpandedDefinition],
 ) -> list[_CompiledService]:
-    by_key: dict[str, ResolvedByKey] = {}
+    by_internal_id: dict[str, ResolvedByInternalId] = {}
+    public_key_index: dict[str, str] = {}
     type_index: dict[Any, list[str]] = defaultdict(list)
 
+    anon_seq = 0
     for definition, key, static_kwargs, deps, signature in compiled:
-        if key in by_key:
-            first = by_key[key][0]
-            raise RuntimeError(
-                f"Duplicate service key '{key}' from {first.origin} and {definition.origin}."
-            )
+        if key is not None:
+            existing_internal_id = public_key_index.get(key)
+            if existing_internal_id is not None:
+                first = by_internal_id[existing_internal_id][0]
+                raise RuntimeError(
+                    f"Duplicate service key '{key}' from {first.origin} and {definition.origin}."
+                )
+            internal_id = key
+            public_key_index[key] = internal_id
+        else:
+            anon_seq += 1
+            internal_id = f"anonymous:{definition.origin}:{anon_seq}"
 
         service_type = definition.exposed_type
         if service_type is None:
             service_type = ServiceContainer._infer_service_type(definition.ctor)
         if service_type is None:
             service_type = definition.service_cls
-        by_key[key] = (definition, deps, signature, static_kwargs, service_type)
-        type_index[service_type].append(key)
+        by_internal_id[internal_id] = (
+            definition,
+            deps,
+            signature,
+            static_kwargs,
+            service_type,
+            key,
+        )
+        type_index[service_type].append(internal_id)
 
     dependency_map: dict[str, set[str]] = {}
     resolved: dict[str, ResolvedSpec] = {}
 
-    for key, (definition, deps, signature, static_kwargs, _service_type) in by_key.items():
-        dep_keys: set[str] = set()
+    def _service_label(internal_id: str) -> str:
+        definition, _, _, _, _, registration_key = by_internal_id[internal_id]
+        return registration_key or definition.origin
+
+    for internal_id, (
+        definition,
+        deps,
+        signature,
+        static_kwargs,
+        _service_type,
+        registration_key,
+    ) in by_internal_id.items():
+        service_label = registration_key or definition.origin
+        dep_internal_ids: set[str] = set()
         resolved_deps: list[_ResolvedDependency] = []
 
         for param_name, dep in deps.items():
             if isinstance(dep.target, str):
                 dep_key = dep.target
-            else:
-                candidate_keys = type_index.get(dep.target, [])
-                if not candidate_keys:
+                dep_internal_id = public_key_index.get(dep_key)
+                if dep_internal_id is None:
                     raise RuntimeError(
-                        f"Service '{key}' depends on type {dep.target!r}, but no service provides that type."
+                        f"Service '{service_label}' depends on '{dep_key}', but that service is not registered."
                     )
-                if len(candidate_keys) > 1:
+                resolved_deps.append(
+                    _ResolvedDependency(
+                        param_name=param_name,
+                        dep_key=dep_key,
+                        dep_type=None,
+                    )
+                )
+            else:
+                candidate_plan_keys = type_index.get(dep.target, [])
+                if not candidate_plan_keys:
+                    raise RuntimeError(
+                        f"Service '{service_label}' depends on type {dep.target!r}, but no service provides that type."
+                    )
+                if len(candidate_plan_keys) > 1:
+                    candidate_labels = [_service_label(candidate_id) for candidate_id in candidate_plan_keys]
                     raise RuntimeError(
                         "Service "
-                        f"'{key}' depends on type {dep.target!r}, "
-                        f"but multiple services provide it: {candidate_keys}."
+                        f"'{service_label}' depends on type {dep.target!r}, "
+                        f"but multiple services provide it: {candidate_labels}."
                     )
-                dep_key = candidate_keys[0]
-
-            if dep_key not in by_key:
-                raise RuntimeError(
-                    f"Service '{key}' depends on '{dep_key}', but that service is not registered."
+                dep_internal_id = candidate_plan_keys[0]
+                resolved_deps.append(
+                    _ResolvedDependency(
+                        param_name=param_name,
+                        dep_key=None,
+                        dep_type=dep.target,
+                    )
                 )
 
-            target_definition = by_key[dep_key][0]
+            target_definition = by_internal_id[dep_internal_id][0]
+            target_key = by_internal_id[dep_internal_id][5]
+            target_label = target_key or target_definition.origin
             if (
                 definition.lifetime == ServiceLifetime.SINGLETON
                 and target_definition.lifetime == ServiceLifetime.TRANSIENT
                 and not dep.allow_transient
             ):
                 raise RuntimeError(
-                    f"Singleton service '{key}' depends on transient service '{dep_key}'. "
+                    f"Singleton service '{service_label}' depends on transient service '{target_label}'. "
                     "Use require(..., allow_transient=True) only if this is intentional."
                 )
 
-            dep_keys.add(dep_key)
-            resolved_deps.append(_ResolvedDependency(param_name=param_name, dep_key=dep_key))
+            dep_internal_ids.add(dep_internal_id)
 
-        dependency_map[key] = dep_keys
-        resolved[key] = (
+        dependency_map[internal_id] = dep_internal_ids
+        resolved[internal_id] = (
             definition,
             signature,
             static_kwargs,
             tuple(resolved_deps),
-            by_key[key][4],
+            by_internal_id[internal_id][4],
+            registration_key,
         )
 
     registration_order = _topological_registration_order(dependency_map)
 
     result: list[_CompiledService] = []
-    for key in registration_order:
-        definition, signature, static_kwargs, resolved_deps, service_type = resolved[key]
+    for internal_id in registration_order:
+        definition, signature, static_kwargs, resolved_deps, service_type, registration_key = resolved[internal_id]
         result.append(
             _CompiledService(
                 origin=definition.origin,
-                key=key,
+                internal_id=internal_id,
+                key=registration_key,
                 lifetime=definition.lifetime,
                 eager=definition.eager,
                 ctor=definition.ctor,
@@ -531,7 +617,14 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
             dep_kwargs: dict[str, Any] = {}
             if request is not None:
                 dep_kwargs[request_kwarg_name] = request
-            call_kwargs[dep.param_name] = await container.aget_by_key(dep.dep_key, **dep_kwargs)
+            if dep.dep_key is not None:
+                call_kwargs[dep.param_name] = await container.aget_by_key(dep.dep_key, **dep_kwargs)
+            else:
+                if dep.dep_type is None:  # pragma: no cover - defensive
+                    raise RuntimeError(
+                        f"Invalid dependency spec for parameter '{dep.param_name}': missing key and type."
+                    )
+                call_kwargs[dep.param_name] = await container.aget_by_type(dep.dep_type, **dep_kwargs)
 
         if inspect.iscoroutinefunction(ctor):
             return await ctor(*args, **call_kwargs)
@@ -543,7 +636,9 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
             result = await result
         return result
 
-    _bound_ctor.__name__ = f"autoreg_ctor_{spec.key}"
+    name_suffix = spec.key or spec.origin
+    safe_suffix = "".join(ch if ch.isalnum() else "_" for ch in name_suffix).strip("_") or "service"
+    _bound_ctor.__name__ = f"autoreg_ctor_{safe_suffix}"
     _bound_ctor.__qualname__ = _bound_ctor.__name__
     _bound_ctor.__signature__ = signature
     annotations = dict(getattr(ctor, "__annotations__", {}))
@@ -552,8 +647,9 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
     return _bound_ctor
 
 
-async def register_services_from_registry(container: ServiceContainer) -> list[str]:
+async def register_services_from_registry(container: ServiceContainer) -> list[RegisteredService]:
     plan = build_service_plan()
+    registered_services: list[RegisteredService] = []
     for spec in plan:
         bound_ctor = _make_bound_ctor(container, spec)
         await container.register(
@@ -563,7 +659,17 @@ async def register_services_from_registry(container: ServiceContainer) -> list[s
             spec.dtor,
         )
         if spec.eager:
-            await container.aget_by_key(spec.key)
+            if spec.key is not None:
+                await container.aget_by_key(spec.key)
+            else:
+                await container.aget_by_type(spec.service_type)
+        registered_services.append(
+            RegisteredService(
+                key=spec.key,
+                origin=spec.origin,
+                service_type=spec.service_type,
+            )
+        )
 
     logger.debug("[LIFESPAN] Auto-registered services", count=len(plan))
-    return [spec.key for spec in plan]
+    return registered_services

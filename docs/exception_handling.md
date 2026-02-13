@@ -1,386 +1,139 @@
-# 异常处理系统文档
+# 异常处理文档
 
-## 概述
+## 目标
 
-本 FastAPI 模板提供了一个全面的异常处理系统，包含：
+模板提供统一异常模型，保证：
 
-- **自定义异常类**：用于不同的业务场景
-- **统一的错误响应格式**：确保 API 响应一致性
-- **自动异常处理**：无需在每个端点手动处理错误
+- API 错误响应结构一致
+- 常见 HTTP/校验异常自动转为标准错误
+- 业务异常可读、可扩展
 
----
+核心实现位于 `app/middleware/exception.py`，注册位于 `app/main.py`。
 
-## 自定义异常类
+## 自定义异常类型
 
-### 1. NotFoundException (404)
+基类：`AppException(message, status_code, error_code, details)`
 
-用于资源不存在的情况。
+内置子类：
 
-```python
-from app.middleware.exception import NotFoundException
+- `NotFoundException` (404, `NOT_FOUND`)
+- `UnauthorizedException` (401, `UNAUTHORIZED`)
+- `ForbiddenException` (403, `FORBIDDEN`)
+- `BadRequestException` (400, `BAD_REQUEST`)
+- `ConflictException` (409, `CONFLICT`)
+- `RateLimitException` (429, `RATE_LIMIT_EXCEEDED`)
 
-# 基本用法
-raise NotFoundException("User", 123)
-# 响应: {"error": {"code": "NOT_FOUND", "message": "User not found: 123", ...}}
-
-# 不带标识符
-raise NotFoundException("Settings")
-# 响应: {"error": {"code": "NOT_FOUND", "message": "Settings not found", ...}}
-```
-
-### 2. UnauthorizedException (401)
-
-用于需要认证但未提供凭证的情况。
+示例：
 
 ```python
-from app.middleware.exception import UnauthorizedException
+from app.middleware.exception import BadRequestException, NotFoundException
 
-# 默认消息
-raise UnauthorizedException()
-# 响应: {"error": {"code": "UNAUTHORIZED", "message": "Authentication required"}}
+if user is None:
+    raise NotFoundException("User", user_id)
 
-# 自定义消息
-raise UnauthorizedException("Invalid API token")
-# 响应: {"error": {"code": "UNAUTHORIZED", "message": "Invalid API token"}}
+if "@" not in email:
+    raise BadRequestException(
+        "Invalid email format",
+        details={"field": "email", "value": email},
+    )
 ```
 
-### 3. ForbiddenException (403)
-
-用于认证用户无权访问资源的情况。
-
-```python
-from app.middleware.exception import ForbiddenException
-
-raise ForbiddenException("You don't have permission to delete this resource")
-# 响应: {"error": {"code": "FORBIDDEN", "message": "You don't have permission..."}}
-```
-
-### 4. BadRequestException (400)
-
-用于客户端请求无效的情况。
-
-```python
-from app.middleware.exception import BadRequestException
-
-raise BadRequestException(
-    "Invalid email format",
-    details={"field": "email", "value": "invalid-email"}
-)
-# 响应: {
-#   "error": {
-#     "code": "BAD_REQUEST",
-#     "message": "Invalid email format",
-#     "details": {"field": "email", "value": "invalid-email"}
-#   }
-# }
-```
-
-### 5. ConflictException (409)
-
-用于资源冲突的情况（如重复创建）。
-
-```python
-from app.middleware.exception import ConflictException
-
-raise ConflictException(
-    "User with this email already exists",
-    details={"email": "user@example.com"}
-)
-# 响应: {"error": {"code": "CONFLICT", "message": "User with this email...", ...}}
-```
-
-### 6. RateLimitException (429)
-
-用于超过速率限制的情况。
-
-```python
-from app.middleware.exception import RateLimitException
-
-raise RateLimitException(retry_after=60)
-# 响应: {
-#   "error": {
-#     "code": "RATE_LIMIT_EXCEEDED",
-#     "message": "Rate limit exceeded",
-#     "details": {"retry_after": 60}
-#   }
-# }
-```
-
----
-
-## 使用示例
-
-### 基础端点示例
-
-```python
-from fastapi import APIRouter
-from app.middleware.exception import NotFoundException, BadRequestException
-
-router = APIRouter()
-
-@router.get("/users/{user_id}")
-async def get_user(user_id: int):
-    user = await db.get_user(user_id)
-    
-    if user is None:
-        raise NotFoundException("User", user_id)
-    
-    return user
-
-@router.post("/users")
-async def create_user(email: str, name: str):
-    if not email or "@" not in email:
-        raise BadRequestException(
-            "Invalid email format",
-            details={"field": "email"}
-        )
-    
-    existing = await db.get_user_by_email(email)
-    if existing:
-        raise ConflictException(
-            "User with this email already exists",
-            details={"email": email}
-        )
-    
-    return await db.create_user(email, name)
-```
-
-### 带权限检查的示例
-
-```python
-from app.middleware.exception import ForbiddenException, UnauthorizedException
-
-@router.delete("/posts/{post_id}")
-async def delete_post(post_id: int, current_user: User = Depends(get_current_user)):
-    # 检查认证
-    if current_user is None:
-        raise UnauthorizedException()
-    
-    post = await db.get_post(post_id)
-    if post is None:
-        raise NotFoundException("Post", post_id)
-    
-    # 检查权限
-    if post.author_id != current_user.id:
-        raise ForbiddenException("You can only delete your own posts")
-    
-    await db.delete_post(post_id)
-    return {"message": "Post deleted successfully"}
-```
-
----
-
-## 错误响应格式
-
-所有错误都返回统一的 JSON 格式：
+## 统一错误响应格式
 
 ```json
 {
   "error": {
     "code": "ERROR_CODE",
-    "message": "Human-readable error message",
+    "message": "Human-readable message",
     "details": {
-      "additional": "context",
-      "if": "needed"
+      "optional": "context"
     },
-    "path": "/api/v1/users/123"  // 仅在 DEBUG_MODE=True 时显示
+    "path": "/api/v1/example"
   }
 }
 ```
 
-### 示例响应
+字段说明：
 
-**404 Not Found**:
+- `code`：机器可读错误码
+- `message`：人类可读信息
+- `details`：可选，附加上下文
+- `path`：仅在 `DEBUG_MODE=true` 且有请求路径时返回
 
-```json
-{
-  "error": {
-    "code": "NOT_FOUND",
-    "message": "User not found: 123",
-    "details": {
-      "resource": "User",
-      "identifier": "123"
-    }
-  }
-}
-```
+## 自动处理逻辑
 
-**422 Validation Error**:
+### 1. `RequestValidationError`
 
-```json
-{
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Validation error",
-    "details": {
-      "validation_errors": [
-        {
-          "field": "body.email",
-          "message": "field required",
-          "type": "value_error.missing"
-        }
-      ]
-    }
-  }
-}
-```
+- HTTP 状态：`422`
+- 错误码：`VALIDATION_ERROR`
+- `details.validation_errors`：字段级校验错误列表
+- 当 `DEBUG_MODE=true` 时，附加 `details.body`（已做 JSON 安全序列化）
 
----
+### 2. `HTTPException`
 
-## 自动处理的异常
+状态码映射：
 
-系统自动处理以下异常，无需手动配置：
+| 状态码 | 错误码 |
+| --- | --- |
+| 400 | `BAD_REQUEST` |
+| 401 | `UNAUTHORIZED` |
+| 403 | `FORBIDDEN` |
+| 404 | `NOT_FOUND` |
+| 405 | `METHOD_NOT_ALLOWED` |
+| 409 | `CONFLICT` |
+| 429 | `RATE_LIMIT_EXCEEDED` |
 
-| HTTP 异常 | 状态码 | 错误代码 |
-|----------|--------|---------|
-| 400 Bad Request | 400 | BAD_REQUEST |
-| 401 Unauthorized | 401 | UNAUTHORIZED |
-| 403 Forbidden | 403 | FORBIDDEN |
-| 404 Not Found | 404 | NOT_FOUND |
-| 405 Method Not Allowed | 405 | METHOD_NOT_ALLOWED |
-| 409 Conflict | 409 | CONFLICT |
-| 422 Unprocessable Entity | 422 | VALIDATION_ERROR |
-| 429 Too Many Requests | 429 | RATE_LIMIT_EXCEEDED |
-| 500 Internal Server Error | 500 | INTERNAL_ERROR |
+未命中映射时使用 `HTTP_ERROR`。
 
----
+### 3. `AppException`
 
-## 创建自定义异常
+- 直接使用异常对象中的 `status_code` / `error_code` / `message` / `details`
 
-如果内置异常不满足需求，可以继承 `AppException` 创建自定义异常：
+### 4. 未捕获 `Exception`
+
+- `DEBUG_MODE=true`：重新抛出异常（便于开发期看到完整堆栈）
+- `DEBUG_MODE=false`：返回 `500 INTERNAL_ERROR`
+
+## 注册位置与顺序
+
+`app/main.py` 中按“具体到通用”顺序注册：
 
 ```python
-from app.middleware.exception import AppException
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(AppException, app_exception_handler)
+app.add_exception_handler(Exception, global_exception_handler)
+```
+
+## 扩展自定义异常
+
+```python
 from fastapi import status
+from app.middleware.exception import AppException, app_exception_handler
 
 class PaymentRequiredException(AppException):
-    """Raised when payment is required"""
     def __init__(self, amount: float, currency: str = "USD"):
         super().__init__(
             message=f"Payment of {amount} {currency} required",
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             error_code="PAYMENT_REQUIRED",
-            details={"amount": amount, "currency": currency}
+            details={"amount": amount, "currency": currency},
         )
 
-# 使用
-raise PaymentRequiredException(amount=9.99)
-```
-
-然后在 `main.py` 中注册处理器：
-
-```python
-from app.middleware.exception import app_exception_handler
-from your_module import PaymentRequiredException
-
+# 注册（例如在应用创建阶段）
 app.add_exception_handler(PaymentRequiredException, app_exception_handler)
 ```
 
----
+## 实践建议
 
-## 调试模式差异
-
-### 生产环境 (`DEBUG_MODE=False`)
-
-- 隐藏敏感信息（如完整堆栈跟踪）
-- 不显示请求体内容
-- 不显示请求路径
-- 返回通用错误消息
-
-### 开发环境 (`DEBUG_MODE=True`)
-
-- 显示详细错误信息
-- 包含请求体（用于调试验证错误）
-- 显示请求路径
-- 未处理的异常会重新抛出以显示完整堆栈跟踪
-
----
-
-## 最佳实践
-
-### 1. 使用合适的异常类型
-
-```python
-# ✅ 好的做法
-if user is None:
-    raise NotFoundException("User", user_id)
-
-# ❌ 不好的做法
-if user is None:
-    raise Exception("User not found")  # 会返回 500 而不是 404
-```
-
-### 2. 提供有用的错误详情
-
-```python
-# ✅ 好的做法
-raise BadRequestException(
-    "Invalid date format",
-    details={
-        "field": "start_date",
-        "expected": "YYYY-MM-DD",
-        "received": "2023/01/01"
-    }
-)
-
-# ❌ 不好的做法
-raise BadRequestException("Invalid date")  # 缺少上下文
-```
-
-### 3. 在业务逻辑层抛出异常
-
-```python
-# ✅ 好的做法 - 在服务层抛出
-class UserService:
-    async def get_user(self, user_id: int):
-        user = await self.db.find_user(user_id)
-        if user is None:
-            raise NotFoundException("User", user_id)
-        return user
-
-# API 层保持简洁
-@router.get("/users/{user_id}")
-async def get_user(user_id: int, service: UserService = Depends()):
-    return await service.get_user(user_id)
-```
-
-### 4. 记录适当的日志级别
-
-- `NotFoundException`, `ValidationError` → `logger.info` or `logger.warning`
-- `UnauthorizedException`, `ForbiddenException` → `logger.warning`
-- `AppException` 的子类 → `logger.warning`
-- 未预期的 `Exception` → `logger.exception` (包含堆栈跟踪)
-
----
-
-## 测试异常处理
-
-```python
-import pytest
-from fastapi.testclient import TestClient
-from app.middleware.exception import NotFoundException
-
-def test_not_found_exception():
-    with pytest.raises(NotFoundException) as exc_info:
-        raise NotFoundException("User", 123)
-    
-    assert exc_info.value.status_code == 404
-    assert "User not found" in exc_info.value.message
-
-def test_api_error_response(client: TestClient):
-    response = client.get("/api/v1/users/99999")
-    assert response.status_code == 404
-    
-    data = response.json()
-    assert data["error"]["code"] == "NOT_FOUND"
-    assert "User" in data["error"]["message"]
-```
-
----
+- 业务逻辑层抛业务异常，API Handler 只负责参数/编排。
+- 优先使用内置异常类型，避免直接 `raise Exception(...)`。
+- 为客户端需要分支处理的错误补充 `details` 字段。
+- 生产环境务必关闭 `DEBUG_MODE`。
 
 ## 相关文件
 
-- `app/middleware/exception.py` - 异常类和处理器实现
-- `app/main.py` - 异常处理器注册
-- `app/api/v1/example/example.py` - 示例路由
-- `tests/api/v1/test_demo.py` - API 示例测试（包含基础错误场景）
+- `app/middleware/exception.py`：异常类型与处理器实现
+- `app/main.py`：异常处理器注册
+- `app/api/v1/example/example.py`：示例路由
+- `tests/api/v1/test_demo.py`：示例测试

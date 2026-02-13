@@ -44,10 +44,10 @@ async def lifespan(app: FastAPI):
 
         logger.debug("[LIFESPAN] Registering services via decorators...")
         import_service_modules()
-        registered_keys = await register_services_from_registry(services)
+        registered_services = await register_services_from_registry(services)
         logger.debug(
             "[LIFESPAN] Auto registration completed",
-            count=len(registered_keys),
+            count=len(registered_services),
         )
 
         yield

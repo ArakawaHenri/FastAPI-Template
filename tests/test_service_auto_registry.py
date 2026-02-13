@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.dependencies import ServiceLifetime
+from app.core.dependencies import ServiceContainer, ServiceLifetime
 from app.core.service_registry import (
+    RegisteredService,
     ServiceRegistry,
     _topological_registration_order,
     build_service_plan,
+    register_services_from_registry,
 )
 from app.services import BaseService, Service, ServiceDict, require
 
@@ -130,3 +132,130 @@ def test_eager_transient_is_rejected(isolated_service_registry):
                 @staticmethod
                 async def ctor() -> "BadTransientService":
                     return BadTransientService()
+
+
+@pytest.mark.asyncio
+async def test_service_decorator_supports_anonymous_registration_defaults(
+    isolated_service_registry,
+):
+    class AnonymousPayloadA:
+        pass
+
+    class AnonymousPayloadB:
+        pass
+
+    @Service
+    class AnonymousServiceA(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor() -> AnonymousPayloadA:
+                return AnonymousPayloadA()
+
+    @Service()
+    class AnonymousServiceB(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor() -> AnonymousPayloadB:
+                return AnonymousPayloadB()
+
+    plan = build_service_plan()
+    anonymous_specs = [spec for spec in plan if spec.key is None]
+    assert len(anonymous_specs) == 2
+    for spec in anonymous_specs:
+        assert spec.lifetime == ServiceLifetime.SINGLETON
+
+    container = ServiceContainer()
+    registered = await register_services_from_registry(container)
+    assert len(registered) == 2
+    assert all(isinstance(item, RegisteredService) for item in registered)
+    assert all(item.key is None for item in registered)
+    assert all(item.origin.endswith(("AnonymousServiceA", "AnonymousServiceB")) for item in registered)
+
+    a1 = await container.aget_by_type(AnonymousPayloadA)
+    a2 = await container.aget_by_type(AnonymousPayloadA)
+    b1 = await container.aget_by_type(AnonymousPayloadB)
+    b2 = await container.aget_by_type(AnonymousPayloadB)
+
+    assert a1 is a2
+    assert b1 is b2
+
+
+@pytest.mark.asyncio
+async def test_named_service_can_depend_on_anonymous_service_by_type(
+    isolated_service_registry,
+):
+    class SharedPayload:
+        pass
+
+    @Service
+    class AnonymousSharedService(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor() -> SharedPayload:
+                return SharedPayload()
+
+    @Service("consumer")
+    class ConsumerService(BaseService):
+        shared: SharedPayload
+
+        def __init__(self, shared: SharedPayload) -> None:
+            self.shared = shared
+
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor(shared=require(SharedPayload)) -> "ConsumerService":
+                return ConsumerService(shared)
+
+    container = ServiceContainer()
+    await register_services_from_registry(container)
+
+    consumer = await container.aget_by_key("consumer")
+    shared = await container.aget_by_type(SharedPayload)
+    assert isinstance(consumer, ConsumerService)
+    assert consumer.shared is shared
+
+
+@pytest.mark.asyncio
+async def test_anonymous_services_with_same_inferred_type_conflict_on_register(
+    isolated_service_registry,
+):
+    class SharedType:
+        pass
+
+    @Service
+    class AnonymousOne(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor() -> SharedType:
+                return SharedType()
+
+    @Service()
+    class AnonymousTwo(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor() -> SharedType:
+                return SharedType()
+
+    container = ServiceContainer()
+    with pytest.raises(RuntimeError, match="Anonymous registration for type"):
+        await register_services_from_registry(container)
+
+
+def test_require_string_key_cannot_target_anonymous_service(isolated_service_registry):
+    @Service
+    class AnonymousOnly(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor() -> "AnonymousOnly":
+                return AnonymousOnly()
+
+    @Service("consumer")
+    class ConsumerByKey(BaseService):
+        class LifespanTasks(BaseService.LifespanTasks):
+            @staticmethod
+            async def ctor(dep=require("anonymous_only")) -> "ConsumerByKey":
+                _ = dep
+                return ConsumerByKey()
+
+    with pytest.raises(RuntimeError, match="depends on 'anonymous_only'"):
+        build_service_plan()
