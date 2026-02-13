@@ -1,14 +1,94 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import time
+from collections.abc import Callable, Coroutine
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 from loguru import logger
 
 from app.services.store import ExpiryCallbackDeferred, ExpiryCallbackEvent
 
+from ._metadata import _Metadata
+
+_T = TypeVar("_T")
+
 
 class TempFileReconcilerMixin:
+    _retention_seconds: float
+    _namespace_lock: asyncio.Lock
+    _store: Any
+    _namespace: str
+    _total_size_bytes: int
+    _base_dir: Path
+    _closed: bool
+    _executor_shutdown: bool
+    INTERNAL_ARTIFACT_RETENTION_SECONDS: ClassVar[int]
+
+    if TYPE_CHECKING:
+        async def _run_in_executor(
+            self,
+            fn: Callable[..., _T],
+            *args: object,
+            **kwargs: object,
+        ) -> _T:
+            ...
+
+        def _scan_files(self) -> list[tuple[str, float, int]]:
+            ...
+
+        @classmethod
+        def _is_internal_artifact_name(cls, name: str) -> bool:
+            ...
+
+        def _decode_metadata(self, value: object) -> _Metadata | None:
+            ...
+
+        def _delete_files(self, names: list[str]) -> int:
+            ...
+
+        def _read_file_bytes(self, path: Path) -> bytes:
+            ...
+
+        @staticmethod
+        def _is_utf8(data: bytes) -> bool:
+            ...
+
+        async def _write_metadata(
+            self,
+            name: str,
+            is_text: bool,
+            retention_minutes: int,
+            revision: str,
+        ) -> None:
+            ...
+
+        def _new_revision(self) -> str:
+            ...
+
+        def _is_runtime_thread(self) -> bool:
+            ...
+
+        async def _run_on_runtime_thread(
+            self,
+            fn: Callable[..., Coroutine[object, object, _T]],
+            *args: object,
+            **kwargs: object,
+        ) -> _T:
+            ...
+
+        @staticmethod
+        def _get_mtime(path: Path) -> float:
+            ...
+
+        async def _read_metadata(self, name: str) -> _Metadata | None:
+            ...
+
+        def _delete_file(self, name: str) -> int:
+            ...
+
     async def _adopt_existing_files(self) -> None:
         now = time.time()
         await self._reconcile_files(now, adopt_fresh=True)

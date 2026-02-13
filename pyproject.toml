@@ -21,6 +21,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
     "ruff>=0.1.0",
+    "mypy>=1.11.0",
 ]
 
 [tool.pytest.ini_options]
@@ -61,3 +62,64 @@ ignore = [
 "app/services/*/main.py" = [
     "F821",
 ] # Allow forward references in service implementations
+
+[tool.mypy]
+python_version = "3.12"
+files = [
+    "app/__init__.py",
+    "app/main.py",
+    "app/lifespan/__init__.py",
+    "app/lifespan/main.py",
+    "app/api/__init__.py",
+    "app/api/main.py",
+    "app/api/v1/__init__.py",
+    "app/api/v1/main.py",
+    "app/api/v1/example/__init__.py",
+    "app/api/v1/example/example.py",
+    "app/core/__init__.py",
+    "app/core/settings.py",
+    "app/core/logger.py",
+    "app/core/dependencies.py",
+    "app/core/service_registry.py",
+    "app/middleware/__init__.py",
+    "app/middleware/exception.py",
+    "app/middleware/logging.py",
+    "app/services/__init__.py",
+    "app/services/base.py",
+    "app/services/async_generator_example/__init__.py",
+    "app/services/async_generator_example/main.py",
+    "app/services/database/__init__.py",
+    "app/services/database/main.py",
+    "app/services/semaphore/__init__.py",
+    "app/services/semaphore/main.py",
+    "app/services/store/__init__.py",
+    "app/services/store/_callback_engine.py",
+    "app/services/store/_callback_pipeline.py",
+    "app/services/store/_exclusive_locking.py",
+    "app/services/store/_runtime.py",
+    "app/services/store/_runtime_dispatch.py",
+    "app/services/store/_sizing.py",
+    "app/services/store/_storage_path.py",
+    "app/services/store/_types.py",
+    "app/services/store/main.py",
+    "app/services/temp_file/__init__.py",
+    "app/services/temp_file/_file_ops.py",
+    "app/services/temp_file/_filename.py",
+    "app/services/temp_file/_metadata.py",
+    "app/services/temp_file/_reconciler.py",
+    "app/services/temp_file/_runtime.py",
+    "app/services/temp_file/_runtime_dispatch.py",
+    "app/services/temp_file/main.py",
+    "app/services/transient_example/__init__.py",
+    "app/services/transient_example/main.py",
+]
+follow_imports = "skip"
+show_error_codes = true
+pretty = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+ignore_missing_imports = true

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from functools import partial
 from types import TracebackType
-from typing import ParamSpec, Protocol, TypeVar
+from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar
 from uuid import uuid4
 
 from loguru import logger
@@ -53,7 +54,7 @@ class StoreExclusiveNamespaceLock:
 
     def create_task(
         self,
-        coro: Awaitable[_T],
+        coro: Coroutine[object, object, _T],
         *,
         name: str | None = None,
     ) -> asyncio.Task[_T]:
@@ -66,7 +67,7 @@ class StoreExclusiveNamespaceLock:
 
     def start_soon(
         self,
-        fn: Callable[_P, Awaitable[_T]],
+        fn: Callable[_P, Coroutine[object, object, _T]],
         *args: _P.args,
         **kwargs: _P.kwargs,
     ) -> asyncio.Task[_T]:
@@ -105,6 +106,28 @@ class StoreExclusiveNamespaceLock:
 
 
 class StoreExclusiveLockingMixin:
+    _exclusive_registry_lock: threading.Lock
+    _exclusive_locks: dict[str, threading.Lock]
+    _exclusive_active_leases: dict[str, str]
+    _exclusive_guard: contextvars.ContextVar[dict[str, tuple[str, int]] | None]
+
+    if TYPE_CHECKING:
+        def _encode_namespace(self, namespace: str) -> str:
+            ...
+
+        async def _await_cancellable_thread_call(
+            self,
+            fn: Callable[[threading.Event], _T],
+        ) -> _T:
+            ...
+
+        @staticmethod
+        def _acquire_thread_lock_cancellable(
+            lock: threading.Lock,
+            cancel_event: threading.Event,
+        ) -> bool:
+            ...
+
     def create_namespace_lock(self, namespace: str) -> StoreExclusiveNamespaceLock:
         self._encode_namespace(namespace)
         with self._exclusive_registry_lock:

@@ -16,7 +16,9 @@ from collections.abc import Iterator as IteratorABC
 from enum import IntEnum
 from typing import (
     Annotated,
+    Protocol,
     TypeVar,
+    cast,
     get_args,
     get_origin,
     get_type_hints,
@@ -155,9 +157,6 @@ class ServiceContainer:
             - Contextmanager-style factories (sync/async) are rejected
               (use TRANSIENT lifetime for those).
             """
-            if self.instance is not None:
-                return
-
             async with self._async_lock:
                 if self.instance is not None:
                     return
@@ -807,14 +806,6 @@ class ServiceContainer:
                 logger.error(msg)
                 raise RuntimeError(msg)
 
-            if dtor is not None and not callable(dtor):
-                msg = (
-                    f"Invalid destructor for service key={public_key!r}: "
-                    f"expected a callable or None, got {type(dtor)!r}."
-                )
-                logger.error(msg)
-                raise TypeError(msg)
-
             service_type = self._infer_service_type(ctor)
 
             if lifetime == ServiceLifetime.SINGLETON:
@@ -1088,6 +1079,14 @@ class ServiceContainerRegistry:
 _APP_STATE_REGISTRY_LOCK = threading.Lock()
 
 
+class _AppStateWithRegistry(Protocol):
+    sc_registry: ServiceContainerRegistry
+
+
+class _CallableWithSignature(Protocol):
+    __signature__: inspect.Signature
+
+
 def get_or_create_service_container_registry(
     app_state: object,
 ) -> ServiceContainerRegistry:
@@ -1103,7 +1102,8 @@ def get_or_create_service_container_registry(
         if isinstance(registry, ServiceContainerRegistry):
             return registry
         registry = ServiceContainerRegistry()
-        app_state.sc_registry = registry
+        state = cast(_AppStateWithRegistry, app_state)
+        state.sc_registry = registry
         return registry
 
 
@@ -1148,6 +1148,7 @@ def Inject(
        This requires that exactly one service of type MyType is registered.
     """
     # Decide lookup mode.
+    lookup_value: str | type[object]
     if isinstance(target, str):
         key_specified = True
         lookup_value = target
@@ -1230,7 +1231,7 @@ def Inject(
         # Attach request for tracking transient finalizers.
         final_kwargs[services.request_kwarg_name()] = request
 
-        if key_specified:
+        if isinstance(lookup_value, str):
             return await services.aget_by_key(lookup_value, *final_args, **final_kwargs)
         return await services.aget_by_type(lookup_value, *final_args, **final_kwargs)
 
@@ -1245,7 +1246,10 @@ def Inject(
         f"inject_{'key' if key_specified else 'type'}_{name_suffix}"
     )
     _dependency_callable.__qualname__ = _dependency_callable.__name__
-    _dependency_callable.__signature__ = sig
+    dependency_callable_with_signature = cast(
+        _CallableWithSignature, _dependency_callable
+    )
+    dependency_callable_with_signature.__signature__ = sig
 
     return Depends(_dependency_callable)
 

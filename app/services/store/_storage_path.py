@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import itertools
 import struct
+import threading
 import time
+from collections.abc import Callable, Coroutine
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import quote, unquote
 
 import cbor2
@@ -18,9 +23,84 @@ _META_NS_INTERNAL_PREFIX = b"nsi:"
 _EXP_DB_PREFIX = b"__exp__:"
 _EXPMETA_DB_PREFIX = b"__expmeta__:"
 _CALLBACK_ENTRY_DB_PREFIX = b"__cbentry__:"
+_T = TypeVar("_T")
 
 
 class StoreStorageDataPathMixin:
+    _namespace_lock: asyncio.Lock
+    _namespaces: set[str]
+    _internal_namespaces: set[str]
+    _write_lock: asyncio.Lock
+    _callback_guard: contextvars.ContextVar[bool]
+    _config: Any
+    _db_cache: dict[str, lmdb._Database]
+    _db_cache_lock: threading.Lock
+    _exp_cache: dict[str, lmdb._Database]
+    _expmeta_cache: dict[str, lmdb._Database]
+    _callback_entry_cache: dict[str, lmdb._Database]
+    _meta_env: Any
+    _env: Any
+    _meta_db: lmdb._Database
+
+    if TYPE_CHECKING:
+        async def _run_in_executor(
+            self,
+            fn: Callable[..., _T],
+            *args: object,
+            **kwargs: object,
+        ) -> _T:
+            ...
+
+        async def _run_on_runtime_thread(
+            self,
+            fn: Callable[..., Coroutine[object, object, _T]],
+            *args: object,
+            **kwargs: object,
+        ) -> _T:
+            ...
+
+        def _is_runtime_thread(self) -> bool:
+            ...
+
+        def _write_meta_txn_with_resize(
+            self,
+            fn: Callable[[Any], None],
+            estimated_write_bytes: int,
+        ) -> None:
+            ...
+
+        def _write_data_txn_with_resize(
+            self,
+            fn: Callable[[Any], None],
+            estimated_write_bytes: int,
+        ) -> None:
+            ...
+
+        def _open_data_db(self, name: bytes, **kwargs: object) -> lmdb._Database:
+            ...
+
+        def _open_meta_db(self, name: bytes, **kwargs: object) -> lmdb._Database:
+            ...
+
+        def _decode_callback_name(self, raw: bytes) -> str | None:
+            ...
+
+        def _serialize_new_callback_jobs(
+            self,
+            events: list[ExpiryCallbackEvent],
+            *,
+            due_ts: int | None = None,
+        ) -> tuple[bytes, list[tuple[bytes, bytes, str]], int]:
+            ...
+
+        def _persist_serialized_callback_jobs_in_txn(
+            self,
+            txn: Any,
+            due_key: bytes,
+            serialized_events: list[tuple[bytes, bytes, str]],
+        ) -> None:
+            ...
+
     async def _namespace_exists(self, namespace: str) -> bool:
         async with self._namespace_lock:
             if namespace in self._namespaces:

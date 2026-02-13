@@ -5,6 +5,7 @@ import logging
 import sys
 import threading
 from pathlib import Path
+from types import FrameType
 
 from loguru import logger
 
@@ -27,13 +28,15 @@ _CONFIG_MISMATCH_WARNING = (
 
 class InterceptHandler(logging.Handler):
     def emit(self, record: logging.LogRecord):
+        level: str | int
         try:
             level = logger.level(record.levelname).name
         except ValueError:
             level = record.levelno
 
-        frame, depth = logging.currentframe(), 2
-        while frame.f_code.co_filename == logging.__file__:
+        frame: FrameType | None = logging.currentframe()
+        depth = 2
+        while frame is not None and frame.f_code.co_filename == logging.__file__:
             frame = frame.f_back
             depth += 1
 

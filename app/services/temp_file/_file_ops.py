@@ -5,6 +5,7 @@ import os
 import stat
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import quote
 
 from loguru import logger
@@ -21,6 +22,15 @@ type _ScannedFileEntry = tuple[str, float, int]
 
 
 class TempFileFileOpsMixin:
+    _base_dir: Path
+    INTERNAL_STAGING_PREFIX: ClassVar[str]
+    INTERNAL_BACKUP_PREFIX: ClassVar[str]
+
+    if TYPE_CHECKING:
+        @staticmethod
+        def _tighten_file_permissions(path: Path) -> None:
+            ...
+
     def _sanitize_filename(self, filename: str) -> str:
         if not filename or filename.strip() == "":
             raise ValueError("Filename must be non-empty")

@@ -1,22 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import struct
 import threading
 import time
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from collections.abc import Callable
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import uuid4
 
 import cbor2
+from filelock import FileLock
 from loguru import logger
 
-from ._callback_engine import decode_job_payload, encode_job_payload, extract_callback_name
+from ._callback_engine import (
+    CallbackLogThrottler,
+    decode_job_payload,
+    encode_job_payload,
+    extract_callback_name,
+)
 from ._types import (
     ExpiryCallback,
     ExpiryCallbackDeferred,
     ExpiryCallbackEvent,
     _CallbackExecutionResult,
     _CallbackJob,
+    _CallbackRegistration,
 )
 
 _EXPIRY_STRUCT = struct.Struct(">q")  # int64, epoch seconds; 0 means no expiry
@@ -27,9 +44,54 @@ _CALLBACK_RETRY_BASE_SECONDS = 1
 _CALLBACK_RETRY_MAX_SECONDS = 30
 
 type _SerializedCallbackJob = tuple[bytes, bytes, str]
+_T = TypeVar("_T")
 
 
 class StoreCallbackPipelineMixin:
+    _base_dir: Path
+    _callback_executor: ThreadPoolExecutor
+    _callback_future: Future[None] | None
+    _callback_dispatch_stop: threading.Event
+    _callback_wakeup: threading.Event
+    _callback_active: threading.Event
+    _callback_lock_handle: FileLock | None
+    _callback_registry_lock: threading.Lock
+    _callback_registry: dict[str, _CallbackRegistration]
+    _callback_runner_executor: ThreadPoolExecutor
+    _callback_guard: contextvars.ContextVar[bool]
+    _meta_env: Any
+    _callback_job_db: Any
+    _callback_schedule_db: Any
+    _callback_dead_letter_db: Any
+    _callback_count_db: Any
+    _callback_db: Any
+    _callback_log_throttler: CallbackLogThrottler
+    _callback_count_index_needs_rebuild: bool
+
+    if TYPE_CHECKING:
+        async def _run_in_executor(
+            self,
+            fn: Callable[..., _T],
+            *args: object,
+            **kwargs: object,
+        ) -> _T:
+            ...
+
+        @staticmethod
+        def _try_acquire_file_lock(path: Path) -> FileLock | None:
+            ...
+
+        @staticmethod
+        def _release_file_lock(handle: FileLock | None) -> None:
+            ...
+
+        def _write_meta_txn_with_resize(
+            self,
+            fn: Callable[[Any], None],
+            estimated_write_bytes: int,
+        ) -> None:
+            ...
+
     async def _ensure_callback_worker(self) -> bool:
         if self._callback_future is not None:
             if not self._callback_future.done():
@@ -175,9 +237,16 @@ class StoreCallbackPipelineMixin:
     ) -> None:
         token = self._callback_guard.set(True)
         try:
-            asyncio.run(callback(event))
+            asyncio.run(self._invoke_callback(callback, event))
         finally:
             self._callback_guard.reset(token)
+
+    @staticmethod
+    async def _invoke_callback(
+        callback: ExpiryCallback,
+        event: ExpiryCallbackEvent,
+    ) -> None:
+        await callback(event)
 
     @staticmethod
     def _encode_callback_job_payload(event: ExpiryCallbackEvent, attempts: int) -> bytes:
@@ -403,13 +472,30 @@ class StoreCallbackPipelineMixin:
             logger.exception("[STORE] Corrupt callback job payload; dropping")
             return None
         try:
-            attempts_raw = int(data.get("attempts", 0))
+            attempts_value = data.get("attempts", 0)
+            if isinstance(attempts_value, bool):
+                attempts_raw = int(attempts_value)
+            elif isinstance(attempts_value, int):
+                attempts_raw = attempts_value
+            elif isinstance(attempts_value, (str, bytes, bytearray)):
+                attempts_raw = int(attempts_value)
+            else:
+                attempts_raw = 0
             attempts = attempts_raw if attempts_raw >= 0 else 0
+            expire_ts_value = data["expire_ts"]
+            if isinstance(expire_ts_value, bool):
+                expire_ts = int(expire_ts_value)
+            elif isinstance(expire_ts_value, int):
+                expire_ts = expire_ts_value
+            elif isinstance(expire_ts_value, (str, bytes, bytearray)):
+                expire_ts = int(expire_ts_value)
+            else:
+                raise TypeError("Invalid expire_ts value")
             event = ExpiryCallbackEvent(
                 namespace=str(data["namespace"]),
                 key=str(data["key"]),
                 value=data.get("value"),
-                expire_ts=int(data["expire_ts"]),
+                expire_ts=expire_ts,
                 callback=str(data["callback"]),
             )
             return event, attempts

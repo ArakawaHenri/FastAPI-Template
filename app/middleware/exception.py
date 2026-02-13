@@ -130,18 +130,17 @@ def create_error_response(
     request_path: str | None = None
 ) -> JSONResponse:
     """Create standardized error response"""
-    content = {
-        "error": {
-            "code": error_code,
-            "message": message,
-        }
+    error_content: dict[str, object] = {
+        "code": error_code,
+        "message": message,
     }
+    content: dict[str, object] = {"error": error_content}
 
     if details:
-        content["error"]["details"] = details
+        error_content["details"] = details
 
     if settings.debug_mode and request_path:
-        content["error"]["path"] = request_path
+        error_content["path"] = request_path
 
     return JSONResponse(status_code=status_code, content=content)
 
@@ -167,7 +166,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "type": error["type"]
         })
 
-    details = {"validation_errors": formatted_errors}
+    details: dict[str, object] = {"validation_errors": formatted_errors}
 
     # Include request body only in debug mode
     if settings.debug_mode:

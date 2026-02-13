@@ -8,14 +8,14 @@ import threading
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol, TypeVar, cast, overload
 
 from loguru import logger
 
 from app.core.dependencies import ServiceContainer, ServiceLifetime
 
 Ctor = Callable[..., object]
-Dtor = Callable[[object], object | Awaitable[object]] | None
+Dtor = Callable[[object], None | Awaitable[None]] | None
 LifetimeLike = ServiceLifetime | int | Literal[
     "Singleton",
     "Transient",
@@ -45,6 +45,11 @@ ResolvedSpec = tuple[
     object,
     str | None,
 ]
+_S = TypeVar("_S", bound=object)
+
+
+class _CallableWithSignature(Protocol):
+    __signature__: inspect.Signature
 
 
 @dataclass(frozen=True)
@@ -226,6 +231,28 @@ def _register_service_class(
     )
     ServiceRegistry.register(definition)
     return service_cls
+
+
+@overload
+def Service(
+    key: type[_S],
+    *,
+    lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
+    eager: bool = False,
+    exposed_type: object | None = None,
+) -> type[_S]:
+    ...
+
+
+@overload
+def Service(
+    key: str | None = None,
+    *,
+    lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
+    eager: bool = False,
+    exposed_type: object | None = None,
+) -> Callable[[type[_S]], type[_S]]:
+    ...
 
 
 def Service(
@@ -506,7 +533,14 @@ def _resolve_dependency_targets(
 
     result: list[_CompiledService] = []
     for internal_id in registration_order:
-        definition, signature, static_kwargs, resolved_deps, service_type, registration_key = resolved[internal_id]
+        (
+            definition,
+            signature,
+            static_kwargs,
+            resolved_dependencies,
+            service_type,
+            registration_key,
+        ) = resolved[internal_id]
         result.append(
             _CompiledService(
                 origin=definition.origin,
@@ -518,7 +552,7 @@ def _resolve_dependency_targets(
                 dtor=definition.dtor,
                 signature=signature,
                 static_kwargs=static_kwargs,
-                dependencies=resolved_deps,
+                dependencies=resolved_dependencies,
                 service_type=service_type,
             )
         )
@@ -645,7 +679,8 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
     safe_suffix = "".join(ch if ch.isalnum() else "_" for ch in name_suffix).strip("_") or "service"
     _bound_ctor.__name__ = f"autoreg_ctor_{safe_suffix}"
     _bound_ctor.__qualname__ = _bound_ctor.__name__
-    _bound_ctor.__signature__ = signature
+    bound_ctor_with_signature = cast(_CallableWithSignature, _bound_ctor)
+    bound_ctor_with_signature.__signature__ = signature
     annotations = dict(getattr(ctor, "__annotations__", {}))
     annotations["return"] = spec.service_type
     _bound_ctor.__annotations__ = annotations

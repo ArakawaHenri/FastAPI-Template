@@ -1,13 +1,54 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from loguru import logger
 
 type _Metadata = tuple[bool, str]
+_T = TypeVar("_T")
 
 
 class TempFileMetadataMixin:
+    _base_dir: Path
+    _namespace_lock: asyncio.Lock
+    _namespace: str
+    _callback_name: str
+    _retention_minutes: int
+    _retention_seconds: float
+    _store: Any
+
+    if TYPE_CHECKING:
+        def _encode_metadata(self, is_text: bool, revision: str) -> object:
+            ...
+
+        def _decode_metadata(self, value: object) -> _Metadata | None:
+            ...
+
+        async def _run_in_executor(
+            self,
+            fn: Callable[..., _T],
+            *args: object,
+            **kwargs: object,
+        ) -> _T:
+            ...
+
+        @staticmethod
+        def _get_mtime(path: Path) -> float:
+            ...
+
+        def _delete_file(self, name: str) -> int:
+            ...
+
+        @staticmethod
+        def _is_utf8(data: bytes) -> bool:
+            ...
+
+        def _new_revision(self) -> str:
+            ...
+
     async def _write_metadata(
         self,
         name: str,

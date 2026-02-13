@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor
 from typing import ParamSpec, TypeVar
 
 from loguru import logger
@@ -21,6 +22,9 @@ _T = TypeVar("_T")
 
 
 class TempFileRuntimeDispatchMixin:
+    _closed: bool
+    _executor: ThreadPoolExecutor
+
     def _init_runtime_dispatch_state(self) -> None:
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
         self._runtime_thread: threading.Thread | None = None
@@ -73,7 +77,7 @@ class TempFileRuntimeDispatchMixin:
             return True
         return False
 
-    def _make_runtime_submit_releaser(self) -> Callable[[object | None], None]:
+    def _make_runtime_submit_releaser(self) -> Callable[..., None]:
         released = False
         released_lock = threading.Lock()
 
@@ -142,7 +146,7 @@ class TempFileRuntimeDispatchMixin:
 
     async def _run_on_runtime_thread(
         self,
-        fn: Callable[_P, Awaitable[_T]],
+        fn: Callable[_P, Coroutine[object, object, _T]],
         *args: _P.args,
         **kwargs: _P.kwargs,
     ) -> _T:
@@ -166,11 +170,8 @@ class TempFileRuntimeDispatchMixin:
         except Exception:
             release_slot()
             raise
-        if not inspect.isawaitable(coro):
-            release_slot()
-            raise TypeError("Runtime-dispatched function must return an awaitable")
         try:
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            future: ConcurrentFuture[_T] = asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception:
             coro.close()
             release_slot()

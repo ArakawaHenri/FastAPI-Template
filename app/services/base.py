@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from app.core.service_registry import Service, ServiceDict, require
 
@@ -16,11 +17,11 @@ class BaseService(ABC):
     class LifespanTasks(ABC):
         @staticmethod
         @abstractmethod
-        async def ctor(*args, **kwargs) -> BaseService:
+        def ctor(*args: Any, **kwargs: Any) -> object:
             raise NotImplementedError
 
         @staticmethod
-        async def dtor(instance: BaseService) -> None:  # noqa: B027
+        async def dtor(instance: Any) -> None:  # noqa: B027
             """Override for cleanup. Default is no-op."""
             pass
 

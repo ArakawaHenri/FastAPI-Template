@@ -234,7 +234,7 @@ class TempFileService(
     ) -> TempFileService:
         key = cls._shared_temp_key(config, store)
         signature = cls._shared_temp_signature(config)
-        entry: _SharedTempFileEntry
+        entry: _SharedTempFileEntry | None = None
         created = False
         while True:
             close_waiter: threading.Event | None = None
@@ -256,6 +256,9 @@ class TempFileService(
                 await asyncio.to_thread(close_waiter.wait)
                 continue
             break
+
+        if entry is None:
+            raise RuntimeError("TempFileService shared entry resolution failed")
 
         if not created:
             try:
