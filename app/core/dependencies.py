@@ -559,6 +559,31 @@ class ServiceContainer:
 
         return _finalizer
 
+    @staticmethod
+    def _validate_destructor(dtor: object | None, key: str | None) -> None:
+        if dtor is None:
+            return
+        if not callable(dtor):
+            msg = (
+                f"Invalid destructor for service key={key!r}: "
+                f"expected a callable or None, got {type(dtor)!r}."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+        try:
+            signature = inspect.signature(dtor)
+        except (TypeError, ValueError):
+            return
+        try:
+            signature.bind(object())
+        except TypeError as exc:
+            msg = (
+                f"Invalid destructor signature for service key={key!r}: "
+                "destructor must accept the service instance as a positional argument."
+            )
+            logger.error(msg)
+            raise TypeError(msg) from exc
+
     async def _aget_impl(
             self,
             service: Service,
@@ -622,7 +647,7 @@ class ServiceContainer:
                 except StopAsyncIteration:
                     raise RuntimeError(
                         f"Async contextmanager service '{key_label}' did not yield a value."
-                    )  # noqa: B904
+                    ) from None
 
                 async def _close_gen() -> None:
                     """
@@ -805,6 +830,9 @@ class ServiceContainer:
                 msg = f"Duplicate service registration for key: {public_key}"
                 logger.error(msg)
                 raise RuntimeError(msg)
+
+            dtor_candidate: object | None = dtor
+            self._validate_destructor(dtor_candidate, public_key)
 
             service_type = self._infer_service_type(ctor)
 

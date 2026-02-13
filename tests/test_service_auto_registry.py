@@ -233,6 +233,40 @@ async def test_anonymous_services_with_same_inferred_type_conflict_on_register(
         await register_services_from_registry(container)
 
 
+@pytest.mark.asyncio
+async def test_inherited_destroy_hook_is_preserved(isolated_service_registry):
+    destroy_calls = 0
+
+    class ParentService(BaseService):
+        @classmethod
+        async def create(cls) -> ParentService:
+            return cls()
+
+        @classmethod
+        async def destroy(cls, instance: object) -> None:
+            nonlocal destroy_calls
+            _ = cls
+            _ = instance
+            destroy_calls += 1
+
+    @Service("child_service")
+    class ChildService(ParentService):
+        @classmethod
+        async def create(cls) -> ChildService:
+            return cls()
+
+    plan = build_service_plan()
+    by_key = {spec.key: spec for spec in plan}
+    assert by_key["child_service"].dtor is not None
+
+    container = ServiceContainer()
+    await register_services_from_registry(container)
+    await container.aget_by_key("child_service")
+    await container.destruct_all_singletons()
+
+    assert destroy_calls == 1
+
+
 def test_require_string_key_cannot_target_anonymous_service(isolated_service_registry):
     @Service
     class AnonymousOnly(BaseService):

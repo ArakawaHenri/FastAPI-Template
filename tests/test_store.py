@@ -80,6 +80,7 @@ async def test_store_lifespan_dtor_closes_instance_when_shared_registry_is_missi
     path = str(tmp_path / "store_lmdb")
     store = await StoreService.create(path=path, map_size_mb=16)
     key = store._shared_instance_key
+    assert key is not None
 
     with StoreService._shared_instances_lock:
         StoreService._shared_instances.pop(key, None)

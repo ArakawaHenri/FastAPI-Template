@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from starlette.requests import Request
@@ -31,8 +32,8 @@ async def test_singleton_lifecycle():
 
     await container.register("test", ServiceLifetime.SINGLETON, factory, None)
 
-    instance1 = await container.aget_by_key("test")
-    instance2 = await container.aget_by_key("test")
+    instance1 = cast(dict[str, int], await container.aget_by_key("test"))
+    instance2 = cast(dict[str, int], await container.aget_by_key("test"))
 
     assert instance1 is instance2
     assert call_count == 1
@@ -109,7 +110,7 @@ async def test_async_generator_service():
 
     await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
 
-    instance = await container.aget_by_key("gen")
+    instance = cast(dict[str, str], await container.aget_by_key("gen"))
     assert instance["data"] == "test"
 
     # Note: In actual usage, cleanup is called automatically at request end
@@ -148,12 +149,13 @@ async def test_singleton_destruction():
     async def factory():
         return {"id": 1}
 
-    async def destructor(instance):
-        destroyed.append(instance["id"])
+    async def destructor(instance: object) -> None:
+        payload = cast(dict[str, int], instance)
+        destroyed.append(payload["id"])
 
     await container.register("test", ServiceLifetime.SINGLETON, factory, destructor)
 
-    instance = await container.aget_by_key("test")
+    instance = cast(dict[str, int], await container.aget_by_key("test"))
     assert instance["id"] == 1
 
     await container.destruct_all_singletons()
@@ -176,6 +178,41 @@ async def test_duplicate_key_registration_fails():
 
 
 @pytest.mark.asyncio
+async def test_register_rejects_non_callable_destructor():
+    container = ServiceContainer()
+
+    async def factory() -> dict[str, str]:
+        return {"ok": "1"}
+
+    with pytest.raises(TypeError, match="Invalid destructor"):
+        await container.register(
+            "bad_dtor",
+            ServiceLifetime.SINGLETON,
+            factory,
+            cast(Any, "not-callable"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_register_rejects_destructor_without_instance_param():
+    container = ServiceContainer()
+
+    async def factory() -> dict[str, str]:
+        return {"ok": "1"}
+
+    async def bad_destructor() -> None:
+        return None
+
+    with pytest.raises(TypeError, match="Invalid destructor signature"):
+        await container.register(
+            "bad_dtor_signature",
+            ServiceLifetime.SINGLETON,
+            factory,
+            cast(Any, bad_destructor),
+        )
+
+
+@pytest.mark.asyncio
 async def test_key_based_injection():
     """Test key-based service injection"""
     container = ServiceContainer()
@@ -185,7 +222,7 @@ async def test_key_based_injection():
 
     await container.register("my_service", ServiceLifetime.SINGLETON, factory, None)
 
-    instance = await container.aget_by_key("my_service")
+    instance = cast(dict[str, str], await container.aget_by_key("my_service"))
     assert instance["message"] == "Hello from service"
 
 

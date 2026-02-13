@@ -23,10 +23,14 @@ async def test_logging_setup_shutdown_is_ref_counted(monkeypatch, tmp_path: Path
     complete_calls: list[int] = []
     basic_config_calls: list[tuple[tuple, dict]] = []
 
+    def _add_sink(*a, **kw) -> int:
+        add_calls.append((a, kw))
+        return len(add_calls)
+
     monkeypatch.setattr(
         logger_module.logger,
         "add",
-        lambda *a, **kw: (add_calls.append((a, kw)) or len(add_calls)),
+        _add_sink,
     )
     monkeypatch.setattr(
         logger_module.logger,
@@ -78,10 +82,14 @@ def test_logging_setup_reuses_existing_config(monkeypatch, tmp_path: Path):
     add_calls: list[tuple[tuple, dict]] = []
     warning_calls: list[tuple[tuple, dict]] = []
 
+    def _add_sink(*a, **kw) -> int:
+        add_calls.append((a, kw))
+        return len(add_calls)
+
     monkeypatch.setattr(
         logger_module.logger,
         "add",
-        lambda *a, **kw: (add_calls.append((a, kw)) or len(add_calls)),
+        _add_sink,
     )
     monkeypatch.setattr(logger_module.logger, "remove", lambda *a, **kw: None)
     monkeypatch.setattr(logger_module.logger, "configure", lambda *a, **kw: None)

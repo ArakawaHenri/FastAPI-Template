@@ -6,6 +6,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -108,6 +109,9 @@ def test_temp_file_callback_name_is_stable_for_same_namespace():
 
 @pytest.mark.asyncio
 async def test_temp_file_lifespan_ctor_reuses_shared_instance_and_capacity(tmp_path: Path):
+    def _is_closed(instance: object) -> bool:
+        return bool(cast(Any, instance)._closed)
+
     store_path = str(tmp_path / "store_lmdb")
     store1 = await StoreService.create(path=store_path, map_size_mb=16)
     store2 = await StoreService.create(path=store_path, map_size_mb=16)
@@ -140,14 +144,14 @@ async def test_temp_file_lifespan_ctor_reuses_shared_instance_and_capacity(tmp_p
         await service2.save("b.bin", b"x" * (400 * 1024))
 
     await TempFileService.destroy(service1)
-    assert not service1._closed
+    assert not _is_closed(service1)
     await TempFileService.destroy(service2)
-    assert service1._closed
+    assert _is_closed(service1)
 
     await StoreService.destroy(store1)
-    assert not store1._closed
+    assert not _is_closed(store1)
     await StoreService.destroy(store2)
-    assert store1._closed
+    assert _is_closed(store1)
 
 
 @pytest.mark.asyncio
@@ -219,6 +223,7 @@ async def test_temp_file_lifespan_dtor_closes_instance_when_shared_registry_is_m
         store_provider=lambda: store,
     )
     key = service._shared_instance_key
+    assert key is not None
 
     with TempFileService._shared_instances_lock:
         TempFileService._shared_instances.pop(key, None)
@@ -452,6 +457,7 @@ async def test_temp_file_lifespan_waiter_cancellation_releases_refcount(
     release.set()
     service = await asyncio.wait_for(creator, timeout=3)
     key = service._shared_instance_key
+    assert key is not None
     with TempFileService._shared_instances_lock:
         entry = TempFileService._shared_instances.get(key)
         assert entry is not None
@@ -463,7 +469,10 @@ async def test_temp_file_lifespan_waiter_cancellation_releases_refcount(
 
 
 @pytest.mark.asyncio
-async def test_temp_file_acquire_shared_waits_for_inflight_shutdown(tmp_path: Path):
+async def test_temp_file_acquire_shared_waits_for_inflight_shutdown(
+    tmp_path: Path,
+    monkeypatch,
+):
     store = await StoreService.create(
         path=str(tmp_path / "store_lmdb"),
         map_size_mb=16,
@@ -491,7 +500,7 @@ async def test_temp_file_acquire_shared_waits_for_inflight_shutdown(tmp_path: Pa
             await allow_shutdown.wait()
         await original_shutdown()
 
-    service.shutdown = delayed_shutdown
+    monkeypatch.setattr(service, "shutdown", delayed_shutdown)
 
     release_task = asyncio.create_task(TempFileService.release_shared(service))
     await asyncio.wait_for(shutdown_started.wait(), timeout=2)
@@ -775,7 +784,7 @@ async def test_save_overwrite_same_name_concurrent_keeps_single_target_file(
     await asyncio.wait_for(asyncio.to_thread(first.wait, 2), timeout=3)
     t2 = asyncio.create_task(writer("two"))
     proceed.set()
-    results = await asyncio.gather(t1, t2)
+    results: list[str] = list(await asyncio.gather(t1, t2))
 
     assert results == ["race.txt", "race.txt"]
     base_dir = Path(service._config.base_dir)

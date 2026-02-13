@@ -16,6 +16,7 @@ from app.core.dependencies import ServiceContainer, ServiceLifetime
 
 Ctor = Callable[..., object]
 Dtor = Callable[[object], None | Awaitable[None]] | None
+_DEFAULT_DESTROY_MARKER = "__service_default_destroy_noop__"
 LifetimeLike = ServiceLifetime | int | Literal[
     "Singleton",
     "Transient",
@@ -191,8 +192,8 @@ def _extract_ctors(service_cls: type[object]) -> tuple[Ctor, Dtor]:
         return ctor, None
     if not isinstance(raw_destroy, classmethod):
         raise TypeError(f"{service_cls!r}.destroy must be defined as @classmethod.")
-    if "destroy" not in service_cls.__dict__:
-        # Inherited default hook from BaseService; skip no-op finalizer registration.
+    if getattr(raw_destroy, _DEFAULT_DESTROY_MARKER, False):
+        # Inherited default no-op hook from BaseService.
         return ctor, None
 
     dtor = getattr(service_cls, "destroy", None)

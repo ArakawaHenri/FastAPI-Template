@@ -45,73 +45,14 @@ select = [
     "C4", # flake8-comprehensions
 ]
 ignore = [
-    "B008", # Allow function calls in argument defaults (FastAPI dependency pattern)
-    "B024", # Allow abstract base classes without abstract methods
-    "E402", # Allow module level imports not at top (for conditional imports)
+    "B008", # Allow DI/require calls in default arguments (FastAPI and service registry pattern)
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"] # Allow unused imports in __init__.py
-"app/core/dependencies.py" = [
-    "B904",
-] # Preserve current explicit exception behavior in DI internals
-"app/services/base.py" = [
-    "F821",
-    "B027",
-] # Allow forward refs and default no-op dtor in base class
-"app/services/*/main.py" = [
-    "F821",
-] # Allow forward references in service implementations
 
 [tool.mypy]
 python_version = "3.12"
 files = [
-    "app/__init__.py",
-    "app/main.py",
-    "app/lifespan/__init__.py",
-    "app/lifespan/main.py",
-    "app/api/__init__.py",
-    "app/api/main.py",
-    "app/api/v1/__init__.py",
-    "app/api/v1/main.py",
-    "app/api/v1/example/__init__.py",
-    "app/api/v1/example/example.py",
-    "app/core/__init__.py",
-    "app/core/settings.py",
-    "app/core/logger.py",
-    "app/core/dependencies.py",
-    "app/core/service_registry.py",
-    "app/middleware/__init__.py",
-    "app/middleware/exception.py",
-    "app/middleware/logging.py",
-    "app/services/__init__.py",
-    "app/services/base.py",
-    "app/services/async_generator_example/__init__.py",
-    "app/services/async_generator_example/main.py",
-    "app/services/database/__init__.py",
-    "app/services/database/main.py",
-    "app/services/semaphore/__init__.py",
-    "app/services/semaphore/main.py",
-    "app/services/store/__init__.py",
-    "app/services/store/_callback_engine.py",
-    "app/services/store/_callback_pipeline.py",
-    "app/services/store/_exclusive_locking.py",
-    "app/services/store/_runtime.py",
-    "app/services/store/_runtime_dispatch.py",
-    "app/services/store/_sizing.py",
-    "app/services/store/_storage_path.py",
-    "app/services/store/_types.py",
-    "app/services/store/main.py",
-    "app/services/temp_file/__init__.py",
-    "app/services/temp_file/_file_ops.py",
-    "app/services/temp_file/_filename.py",
-    "app/services/temp_file/_metadata.py",
-    "app/services/temp_file/_reconciler.py",
-    "app/services/temp_file/_runtime.py",
-    "app/services/temp_file/_runtime_dispatch.py",
-    "app/services/temp_file/main.py",
-    "app/services/transient_example/__init__.py",
-    "app/services/transient_example/main.py",
+    "app/**/*.py",
+    "tests/**/*.py",
 ]
 follow_imports = "skip"
 show_error_codes = true

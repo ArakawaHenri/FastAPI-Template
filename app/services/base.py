@@ -5,6 +5,8 @@ from typing import Any
 
 from app.core.service_registry import Service, ServiceDict, require
 
+_DEFAULT_DESTROY_MARKER = "__service_default_destroy_noop__"
+
 
 class BaseService(ABC):
     """
@@ -23,7 +25,10 @@ class BaseService(ABC):
     @classmethod
     async def destroy(cls, instance: Any) -> None:  # noqa: B027
         """Optional cleanup hook. Override in services that need teardown."""
+        _ = cls
         _ = instance
+
+    setattr(destroy, _DEFAULT_DESTROY_MARKER, True)
 
 
 __all__ = [
