@@ -6,7 +6,6 @@ This file shows best practices and error handling in FastAPI applications.
 from __future__ import annotations
 
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
 
 from app.core.dependencies import Inject
 from app.middleware.exception import (
@@ -37,10 +36,10 @@ async def get(
 
     msg_from_example_generator = example_g.msg
 
-    return JSONResponse({
+    return {
         "msg_from_example_transient": msg_from_example_transient,
         "index_of_item_enumerated_from_example_generator": msg_from_example_generator
-    })
+    }
 
 
 @router.get("/not-found")

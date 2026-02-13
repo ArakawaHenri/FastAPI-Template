@@ -3,9 +3,9 @@ from __future__ import annotations
 from fastapi import Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from loguru import logger
 from starlette.exceptions import HTTPException
+from starlette.responses import Response
 
 from app.core.dependencies import REQUEST_FAILED_STATE_KEY
 from app.core.settings import settings
@@ -123,12 +123,13 @@ def _serialize_debug_body(body: object) -> object:
 
 
 def create_error_response(
+    request: Request,
     status_code: int,
     message: str,
     error_code: str = "ERROR",
     details: dict[str, object] | None = None,
     request_path: str | None = None
-) -> JSONResponse:
+) -> Response:
     """Create standardized error response"""
     error_content: dict[str, object] = {
         "code": error_code,
@@ -142,7 +143,9 @@ def create_error_response(
     if settings.debug_mode and request_path:
         error_content["path"] = request_path
 
-    return JSONResponse(status_code=status_code, content=content)
+    response_class = request.app.router.default_response_class
+    response_class = getattr(response_class, "value", response_class)
+    return response_class(status_code=status_code, content=content)
 
 
 def _mark_request_failed(request: Request) -> None:
@@ -173,6 +176,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         details["body"] = _serialize_debug_body(exc.body)
 
     return create_error_response(
+        request=request,
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         message="Validation error",
         error_code="VALIDATION_ERROR",
@@ -204,6 +208,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     error_code = error_code_mapping.get(exc.status_code, "HTTP_ERROR")
 
     return create_error_response(
+        request=request,
         status_code=exc.status_code,
         message=exc.detail or "HTTP error",
         error_code=error_code,
@@ -222,6 +227,7 @@ async def app_exception_handler(request: Request, exc: AppException):
     )
 
     return create_error_response(
+        request=request,
         status_code=exc.status_code,
         message=exc.message,
         error_code=exc.error_code,
@@ -244,6 +250,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
     # Return generic error in production
     return create_error_response(
+        request=request,
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         message="Internal server error",
         error_code="INTERNAL_ERROR",

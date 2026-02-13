@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
 from app.api import router
@@ -20,8 +21,12 @@ from app.middleware.logging import RequestLoggingMiddleware
 
 
 def create_application() -> FastAPI:
-    app = FastAPI(title=settings.app_name,
-                  version=settings.app_version, lifespan=lifespan)
+    app = FastAPI(
+        title=settings.app_name,
+        version=settings.app_version,
+        lifespan=lifespan,
+        default_response_class=JSONResponse,
+    )
 
     # CORS middleware - read from configuration
     app.add_middleware(
