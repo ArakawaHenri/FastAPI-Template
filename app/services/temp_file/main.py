@@ -88,37 +88,39 @@ class TempFileService(
     INTERNAL_BACKUP_PREFIX = f"{INTERNAL_ARTIFACT_PREFIX}.backup."
     INTERNAL_ARTIFACT_RETENTION_SECONDS = 10 * 60
 
-    class LifespanTasks(BaseService.LifespanTasks):
-        @staticmethod
-        async def ctor(
-            base_dir: str = settings.tmp_dir,
-            retention_days: int = settings.tmp_retention_days,
-            cleanup_interval_seconds: int = settings.tmp_cleanup_interval_seconds,
-            total_size_recalc_seconds: int = settings.tmp_total_size_recalc_seconds,
-            worker_threads: int = settings.tmp_worker_threads,
-            max_file_size_mb: int = settings.tmp_max_file_size_mb,
-            max_total_size_mb: int = settings.tmp_max_total_size_mb,
-            store_provider=require("store_service"),
-        ) -> TempFileService:
-            store = await TempFileService._resolve_store_provider(store_provider)
-            service = await TempFileService.acquire_shared(
-                TempFileConfig(
-                    base_dir=base_dir,
-                    retention_days=retention_days,
-                    cleanup_interval_seconds=cleanup_interval_seconds,
-                    total_size_recalc_seconds=total_size_recalc_seconds,
-                    worker_threads=worker_threads,
-                    max_file_size_mb=max_file_size_mb,
-                    max_total_size_mb=max_total_size_mb,
-                ),
-                store,
-            )
-            await service.start_cleanup()
-            return service
+    @classmethod
+    async def create(
+        cls,
+        base_dir: str = settings.tmp_dir,
+        retention_days: int = settings.tmp_retention_days,
+        cleanup_interval_seconds: int = settings.tmp_cleanup_interval_seconds,
+        total_size_recalc_seconds: int = settings.tmp_total_size_recalc_seconds,
+        worker_threads: int = settings.tmp_worker_threads,
+        max_file_size_mb: int = settings.tmp_max_file_size_mb,
+        max_total_size_mb: int = settings.tmp_max_total_size_mb,
+        store_provider=require("store_service"),
+    ) -> TempFileService:
+        _ = cls
+        store = await TempFileService._resolve_store_provider(store_provider)
+        service = await TempFileService.acquire_shared(
+            TempFileConfig(
+                base_dir=base_dir,
+                retention_days=retention_days,
+                cleanup_interval_seconds=cleanup_interval_seconds,
+                total_size_recalc_seconds=total_size_recalc_seconds,
+                worker_threads=worker_threads,
+                max_file_size_mb=max_file_size_mb,
+                max_total_size_mb=max_total_size_mb,
+            ),
+            store,
+        )
+        await service.start_cleanup()
+        return service
 
-        @staticmethod
-        async def dtor(instance: TempFileService) -> None:
-            await TempFileService.release_shared(instance)
+    @classmethod
+    async def destroy(cls, instance: TempFileService) -> None:
+        _ = cls
+        await TempFileService.release_shared(instance)
 
     # ------------------------------------------------------------------ #
     # Shared-instance lifecycle                                           #

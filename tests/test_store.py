@@ -44,54 +44,54 @@ def _make_store(
 @pytest.mark.asyncio
 async def test_store_lifespan_ctor_reuses_shared_instance(tmp_path):
     path = str(tmp_path / "store_lmdb")
-    store1 = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
-    store2 = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    store1 = await StoreService.create(path=path, map_size_mb=16)
+    store2 = await StoreService.create(path=path, map_size_mb=16)
 
     assert store1 is store2
     assert not store1._closed
 
-    await StoreService.LifespanTasks.dtor(store1)
+    await StoreService.destroy(store1)
     assert not store1._closed
 
-    await StoreService.LifespanTasks.dtor(store2)
+    await StoreService.destroy(store2)
     assert store1._closed
 
 
 @pytest.mark.asyncio
 async def test_store_lifespan_ctor_rejects_shared_config_mismatch(tmp_path):
     path = str(tmp_path / "store_lmdb")
-    store = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    store = await StoreService.create(path=path, map_size_mb=16)
     try:
         with pytest.raises(RuntimeError, match="config mismatch"):
-            await StoreService.LifespanTasks.ctor(path=path, map_size_mb=32)
+            await StoreService.create(path=path, map_size_mb=32)
     finally:
-        await StoreService.LifespanTasks.dtor(store)
+        await StoreService.destroy(store)
 
 
 @pytest.mark.asyncio
 async def test_store_lifespan_dtor_closes_non_shared_instance(tmp_path):
     store = _make_store(tmp_path)
-    await StoreService.LifespanTasks.dtor(store)
+    await StoreService.destroy(store)
     assert store._closed
 
 
 @pytest.mark.asyncio
 async def test_store_lifespan_dtor_closes_instance_when_shared_registry_is_missing(tmp_path):
     path = str(tmp_path / "store_lmdb")
-    store = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    store = await StoreService.create(path=path, map_size_mb=16)
     key = store._shared_instance_key
 
     with StoreService._shared_instances_lock:
         StoreService._shared_instances.pop(key, None)
 
-    await StoreService.LifespanTasks.dtor(store)
+    await StoreService.destroy(store)
     assert store._closed
 
 
 @pytest.mark.asyncio
 async def test_store_acquire_shared_waits_for_inflight_shutdown(tmp_path):
     path = str(tmp_path / "store_lmdb")
-    store = await StoreService.LifespanTasks.ctor(path=path, map_size_mb=16)
+    store = await StoreService.create(path=path, map_size_mb=16)
 
     shutdown_started = asyncio.Event()
     release_shutdown = asyncio.Event()

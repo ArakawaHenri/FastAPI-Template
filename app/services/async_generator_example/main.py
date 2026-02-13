@@ -9,14 +9,13 @@ from app.services import BaseService, Service
 
 @Service("example_generator_transient", lifetime="transient")
 class ExampleGeneratorServiceT(BaseService):
-    class LifespanTasks(BaseService.LifespanTasks):
-        @staticmethod
-        async def ctor(msg: str) -> AsyncIterator[ExampleGeneratorServiceT]:
-            # If you need iteration, expose it from service methods instead.
-            try:
-                yield ExampleGeneratorServiceT(msg)
-            finally:
-                logger.debug("contextmanager finalized")
+    @classmethod
+    async def create(cls, msg: str) -> AsyncIterator[ExampleGeneratorServiceT]:
+        # If you need iteration, expose it from service methods instead.
+        try:
+            yield cls(msg)
+        finally:
+            logger.debug("contextmanager finalized")
 
     msg: str
 

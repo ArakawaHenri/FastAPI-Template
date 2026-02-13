@@ -171,18 +171,33 @@ def _normalize_lifetime(lifetime: LifetimeLike) -> ServiceLifetime:
 
 
 def _extract_ctors(service_cls: type[object]) -> tuple[Ctor, Dtor]:
-    lifespan_tasks = getattr(service_cls, "LifespanTasks", None)
-    if lifespan_tasks is None:
-        raise TypeError(f"{service_cls!r} has no LifespanTasks class")
+    if inspect.isabstract(service_cls):
+        raise TypeError(
+            f"{service_cls!r} is abstract; define a concrete @classmethod create()."
+        )
 
-    ctor = getattr(lifespan_tasks, "ctor", None)
+    raw_create = inspect.getattr_static(service_cls, "create", None)
+    if raw_create is None:
+        raise TypeError(f"{service_cls!r} is missing required classmethod create().")
+    if not isinstance(raw_create, classmethod):
+        raise TypeError(f"{service_cls!r}.create must be defined as @classmethod.")
+
+    ctor = getattr(service_cls, "create", None)
     if ctor is None or not callable(ctor):
-        raise TypeError(f"{service_cls!r}.LifespanTasks.ctor must be callable")
+        raise TypeError(f"{service_cls!r}.create must be callable.")
 
-    dtor = getattr(lifespan_tasks, "dtor", None)
-    if dtor is not None and not callable(dtor):
-        raise TypeError(f"{service_cls!r}.LifespanTasks.dtor must be callable or None")
+    raw_destroy = inspect.getattr_static(service_cls, "destroy", None)
+    if raw_destroy is None:
+        return ctor, None
+    if not isinstance(raw_destroy, classmethod):
+        raise TypeError(f"{service_cls!r}.destroy must be defined as @classmethod.")
+    if "destroy" not in service_cls.__dict__:
+        # Inherited default hook from BaseService; skip no-op finalizer registration.
+        return ctor, None
 
+    dtor = getattr(service_cls, "destroy", None)
+    if dtor is None or not callable(dtor):
+        raise TypeError(f"{service_cls!r}.destroy must be callable.")
     return ctor, dtor
 
 

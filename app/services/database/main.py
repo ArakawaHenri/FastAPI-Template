@@ -26,27 +26,28 @@ class DatabaseEngineService(BaseService):
     Use `get_session()` context manager for transactional operations.
     """
 
-    class LifespanTasks(BaseService.LifespanTasks):
-        @staticmethod
-        async def ctor(
-            url: str,
-            pool_size: int = 5,
-            max_overflow: int = 10,
-            pool_recycle: int = 3600,
-            pool_pre_ping: bool = True
-        ) -> DatabaseEngineService:
-            return DatabaseEngineService(
-                url=url,
-                pool_size=pool_size,
-                max_overflow=max_overflow,
-                pool_recycle=pool_recycle,
-                pool_pre_ping=pool_pre_ping
-            )
+    @classmethod
+    async def create(
+        cls,
+        url: str,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_recycle: int = 3600,
+        pool_pre_ping: bool = True,
+    ) -> DatabaseEngineService:
+        return cls(
+            url=url,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_recycle=pool_recycle,
+            pool_pre_ping=pool_pre_ping,
+        )
 
-        @staticmethod
-        async def dtor(instance: DatabaseEngineService) -> None:
-            await instance.engine.dispose()
-            logger.debug("[DB] Database engine disposed", db_name=instance.db_name)
+    @classmethod
+    async def destroy(cls, instance: DatabaseEngineService) -> None:
+        _ = cls
+        await instance.engine.dispose()
+        logger.debug("[DB] Database engine disposed", db_name=instance.db_name)
 
     def __init__(
         self,
@@ -133,20 +134,20 @@ class DatabaseSessionServiceT(BaseService):
         is AsyncSession (not DatabaseSessionServiceT).
     """
 
-    class LifespanTasks(BaseService.LifespanTasks):
-        @staticmethod
-        async def ctor(engine: DatabaseEngineService) -> AsyncIterator[AsyncSession]:
-            """
-            Async contextmanager-style factory for database sessions.
+    @classmethod
+    async def create(cls, engine: DatabaseEngineService) -> AsyncIterator[AsyncSession]:
+        """
+        Async contextmanager-style factory for database sessions.
 
-            The engine is injected via nested Inject() at endpoint resolution.
-            """
-            async with engine.async_sessionmaker() as session:
-                try:
-                    yield session
-                except Exception:
-                    await session.rollback()
-                    logger.exception("Database transaction failed")
-                    raise
-                else:
-                    await session.commit()
+        The engine is injected via nested Inject() at endpoint resolution.
+        """
+        _ = cls
+        async with engine.async_sessionmaker() as session:
+            try:
+                yield session
+            except Exception:
+                await session.rollback()
+                logger.exception("Database transaction failed")
+                raise
+            else:
+                await session.commit()

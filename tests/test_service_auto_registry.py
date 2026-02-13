@@ -30,29 +30,27 @@ def test_service_dict_expansion_and_require_placeholder_resolution(
 ):
     @Service("shared_dep")
     class SharedDepService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> SharedDepService:
-                return SharedDepService()
+        @classmethod
+        async def create(cls) -> SharedDepService:
+            return cls()
 
     @ServiceDict("root_service", dict={"alpha": {"name": "a"}, "beta": {"name": "b"}})
     class RootService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor(name: str) -> RootService:
-                _ = name
-                return RootService()
+        @classmethod
+        async def create(cls, name: str) -> RootService:
+            _ = name
+            return cls()
 
     @ServiceDict("{}_child_service", dict={"alpha": {}, "beta": {}})
     class ChildService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor(
-                shared=require("shared_dep"),
-                scoped=require("{}_root_service"),
-            ) -> ChildService:
-                _ = shared, scoped
-                return ChildService()
+        @classmethod
+        async def create(
+            cls,
+            shared=require("shared_dep"),
+            scoped=require("{}_root_service"),
+        ) -> ChildService:
+            _ = shared, scoped
+            return cls()
 
     plan = build_service_plan()
     by_key = {spec.key: spec for spec in plan}
@@ -88,31 +86,27 @@ def test_topological_registration_order_detects_cycle():
 def test_service_lifetime_variants_and_eager_flag(isolated_service_registry):
     @Service("singleton_by_int", lifetime=0, eager=True)
     class SingletonByIntService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> SingletonByIntService:
-                return SingletonByIntService()
+        @classmethod
+        async def create(cls) -> SingletonByIntService:
+            return cls()
 
     @Service("transient_by_int", lifetime=1)
     class TransientByIntService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> TransientByIntService:
-                return TransientByIntService()
+        @classmethod
+        async def create(cls) -> TransientByIntService:
+            return cls()
 
     @Service("singleton_by_name", lifetime="Singleton")
     class SingletonByNameService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> SingletonByNameService:
-                return SingletonByNameService()
+        @classmethod
+        async def create(cls) -> SingletonByNameService:
+            return cls()
 
     @Service("transient_by_name", lifetime="transient")
     class TransientByNameService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> TransientByNameService:
-                return TransientByNameService()
+        @classmethod
+        async def create(cls) -> TransientByNameService:
+            return cls()
 
     plan = build_service_plan()
     by_key = {spec.key: spec for spec in plan}
@@ -128,10 +122,9 @@ def test_eager_transient_is_rejected(isolated_service_registry):
     with pytest.raises(ValueError, match="cannot be eager with transient"):
         @Service("bad", lifetime="Transient", eager=True)
         class BadTransientService(BaseService):
-            class LifespanTasks(BaseService.LifespanTasks):
-                @staticmethod
-                async def ctor() -> BadTransientService:
-                    return BadTransientService()
+            @classmethod
+            async def create(cls) -> BadTransientService:
+                return cls()
 
 
 @pytest.mark.asyncio
@@ -146,17 +139,17 @@ async def test_service_decorator_supports_anonymous_registration_defaults(
 
     @Service
     class AnonymousServiceA(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> AnonymousPayloadA:
-                return AnonymousPayloadA()
+        @classmethod
+        async def create(cls) -> AnonymousPayloadA:
+            _ = cls
+            return AnonymousPayloadA()
 
     @Service()
     class AnonymousServiceB(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> AnonymousPayloadB:
-                return AnonymousPayloadB()
+        @classmethod
+        async def create(cls) -> AnonymousPayloadB:
+            _ = cls
+            return AnonymousPayloadB()
 
     plan = build_service_plan()
     anonymous_specs = [spec for spec in plan if spec.key is None]
@@ -189,10 +182,10 @@ async def test_named_service_can_depend_on_anonymous_service_by_type(
 
     @Service
     class AnonymousSharedService(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> SharedPayload:
-                return SharedPayload()
+        @classmethod
+        async def create(cls) -> SharedPayload:
+            _ = cls
+            return SharedPayload()
 
     @Service("consumer")
     class ConsumerService(BaseService):
@@ -201,10 +194,9 @@ async def test_named_service_can_depend_on_anonymous_service_by_type(
         def __init__(self, shared: SharedPayload) -> None:
             self.shared = shared
 
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor(shared=require(SharedPayload)) -> ConsumerService:
-                return ConsumerService(shared)
+        @classmethod
+        async def create(cls, shared=require(SharedPayload)) -> ConsumerService:
+            return cls(shared)
 
     container = ServiceContainer()
     await register_services_from_registry(container)
@@ -224,17 +216,17 @@ async def test_anonymous_services_with_same_inferred_type_conflict_on_register(
 
     @Service
     class AnonymousOne(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> SharedType:
-                return SharedType()
+        @classmethod
+        async def create(cls) -> SharedType:
+            _ = cls
+            return SharedType()
 
     @Service()
     class AnonymousTwo(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> SharedType:
-                return SharedType()
+        @classmethod
+        async def create(cls) -> SharedType:
+            _ = cls
+            return SharedType()
 
     container = ServiceContainer()
     with pytest.raises(RuntimeError, match="Anonymous registration for type"):
@@ -244,18 +236,16 @@ async def test_anonymous_services_with_same_inferred_type_conflict_on_register(
 def test_require_string_key_cannot_target_anonymous_service(isolated_service_registry):
     @Service
     class AnonymousOnly(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor() -> AnonymousOnly:
-                return AnonymousOnly()
+        @classmethod
+        async def create(cls) -> AnonymousOnly:
+            return cls()
 
     @Service("consumer")
     class ConsumerByKey(BaseService):
-        class LifespanTasks(BaseService.LifespanTasks):
-            @staticmethod
-            async def ctor(dep=require("anonymous_only")) -> ConsumerByKey:
-                _ = dep
-                return ConsumerByKey()
+        @classmethod
+        async def create(cls, dep=require("anonymous_only")) -> ConsumerByKey:
+            _ = dep
+            return cls()
 
     with pytest.raises(RuntimeError, match="depends on 'anonymous_only'"):
         build_service_plan()

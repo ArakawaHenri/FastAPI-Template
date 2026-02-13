@@ -14,24 +14,20 @@ class BaseService(ABC):
     Transient services should be named with the suffix "ServiceT".
     """
 
-    class LifespanTasks(ABC):
-        @staticmethod
-        @abstractmethod
-        def ctor(*args: Any, **kwargs: Any) -> object:
-            raise NotImplementedError
+    @classmethod
+    @abstractmethod
+    def create(cls, *args: Any, **kwargs: Any) -> object:
+        """Factory hook used by the service registry."""
+        raise NotImplementedError
 
-        @staticmethod
-        async def dtor(instance: Any) -> None:  # noqa: B027
-            """Override for cleanup. Default is no-op."""
-            pass
-
-
-type LifespanTasks = BaseService.LifespanTasks
+    @classmethod
+    async def destroy(cls, instance: Any) -> None:  # noqa: B027
+        """Optional cleanup hook. Override in services that need teardown."""
+        _ = instance
 
 
 __all__ = [
     "BaseService",
-    "LifespanTasks",
     "Service",
     "ServiceDict",
     "require",

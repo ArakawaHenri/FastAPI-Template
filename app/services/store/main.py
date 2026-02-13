@@ -110,50 +110,52 @@ class StoreService(
     - Expiration is managed via a secondary index (bucketed by minute).
     """
 
-    class LifespanTasks(BaseService.LifespanTasks):
-        @staticmethod
-        async def ctor(
-            path: str = settings.store_lmdb.path,
-            map_size_mb: int = settings.store_lmdb.map_size_mb,
-            map_size_growth_factor: int = settings.store_lmdb.map_size_growth_factor,
-            map_high_watermark: float = settings.store_lmdb.map_high_watermark,
-            max_dbs: int = settings.store_lmdb.max_dbs,
-            max_readers: int = settings.store_lmdb.max_readers,
-            sync: bool = settings.store_lmdb.sync,
-            metasync: bool = settings.store_lmdb.metasync,
-            writemap: bool = settings.store_lmdb.writemap,
-            map_async: bool = settings.store_lmdb.map_async,
-            max_key_bytes: int = settings.store_lmdb.max_key_bytes,
-            max_namespace_bytes: int = settings.store_lmdb.max_namespace_bytes,
-            max_value_bytes: int = settings.store_lmdb.max_value_bytes,
-            cleanup_max_deletes: int = settings.store_lmdb.cleanup_max_deletes,
-            worker_threads: int = settings.store_lmdb.callback_worker_threads,
-        ) -> StoreService:
-            store = await StoreService.acquire_shared(
-                StoreConfig(
-                    path=path,
-                    map_size_mb=map_size_mb,
-                    map_size_growth_factor=map_size_growth_factor,
-                    map_high_watermark=map_high_watermark,
-                    max_dbs=max_dbs,
-                    max_readers=max_readers,
-                    sync=sync,
-                    metasync=metasync,
-                    writemap=writemap,
-                    map_async=map_async,
-                    max_key_bytes=max_key_bytes,
-                    max_namespace_bytes=max_namespace_bytes,
-                    max_value_bytes=max_value_bytes,
-                    cleanup_max_deletes=cleanup_max_deletes,
-                    worker_threads=worker_threads,
-                )
+    @classmethod
+    async def create(
+        cls,
+        path: str = settings.store_lmdb.path,
+        map_size_mb: int = settings.store_lmdb.map_size_mb,
+        map_size_growth_factor: int = settings.store_lmdb.map_size_growth_factor,
+        map_high_watermark: float = settings.store_lmdb.map_high_watermark,
+        max_dbs: int = settings.store_lmdb.max_dbs,
+        max_readers: int = settings.store_lmdb.max_readers,
+        sync: bool = settings.store_lmdb.sync,
+        metasync: bool = settings.store_lmdb.metasync,
+        writemap: bool = settings.store_lmdb.writemap,
+        map_async: bool = settings.store_lmdb.map_async,
+        max_key_bytes: int = settings.store_lmdb.max_key_bytes,
+        max_namespace_bytes: int = settings.store_lmdb.max_namespace_bytes,
+        max_value_bytes: int = settings.store_lmdb.max_value_bytes,
+        cleanup_max_deletes: int = settings.store_lmdb.cleanup_max_deletes,
+        worker_threads: int = settings.store_lmdb.callback_worker_threads,
+    ) -> StoreService:
+        _ = cls
+        store = await StoreService.acquire_shared(
+            StoreConfig(
+                path=path,
+                map_size_mb=map_size_mb,
+                map_size_growth_factor=map_size_growth_factor,
+                map_high_watermark=map_high_watermark,
+                max_dbs=max_dbs,
+                max_readers=max_readers,
+                sync=sync,
+                metasync=metasync,
+                writemap=writemap,
+                map_async=map_async,
+                max_key_bytes=max_key_bytes,
+                max_namespace_bytes=max_namespace_bytes,
+                max_value_bytes=max_value_bytes,
+                cleanup_max_deletes=cleanup_max_deletes,
+                worker_threads=worker_threads,
             )
-            await store.start_cleanup()
-            return store
+        )
+        await store.start_cleanup()
+        return store
 
-        @staticmethod
-        async def dtor(instance: StoreService) -> None:
-            await StoreService.release_shared(instance)
+    @classmethod
+    async def destroy(cls, instance: StoreService) -> None:
+        _ = cls
+        await StoreService.release_shared(instance)
 
     # ------------------------------------------------------------------ #
     # Shared-instance lifecycle                                           #
