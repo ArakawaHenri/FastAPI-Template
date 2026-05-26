@@ -1,0 +1,66 @@
+# macOS / editors
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+settings.yaml
+settings.local.yaml
+settings.*.local.yaml
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.envrc
+
+# Test, type-check, lint, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Tool state
+.tox/
+.nox/
+.cache/
+
+# Runtime data
+data/
+logs/
+temp/
+tmp/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.zlmdb

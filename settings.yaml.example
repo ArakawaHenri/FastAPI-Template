@@ -1,0 +1,53 @@
+server:
+  address: 0.0.0.0
+  port: 8000
+  workers: 1
+  loop: auto
+
+app:
+  title: FastAPI Template
+  version: 0.1.0
+  description: Production-ready FastAPI template with FastAPIEx DI/settings.
+  debug_mode: true
+  log_dir: ./logs
+  cors_origins:
+    - "*"
+
+store:
+  path: ./data/store.zlmdb
+  max_size_mb: 1024
+  sync: false
+  writemap: true
+  max_key_bytes: 1024
+  max_namespace_bytes: 256
+  max_value_bytes: 104857600
+  cleanup_interval_seconds: 60
+  cleanup_max_deletes: 100000
+
+temp_file:
+  base_dir: ./temp
+  retention_days: 7
+  cleanup_interval_seconds: 60
+  buckets:
+    - logs
+    - uploads
+    - exports
+    - scratch
+
+database:
+  main:
+    url: sqlite+aiosqlite:///./data/app.sqlite3
+    echo: false
+    pool_size: 5
+    max_overflow: 10
+    pool_recycle: 3600
+    pool_pre_ping: true
+
+openai_clients:
+  completions:
+    api_key: sk-placeholder
+    base_url: ~
+    timeout: 60.0
+    organization: ~
+    model: gpt-4o-mini
+    concurrency_limit: 20
